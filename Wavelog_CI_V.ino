@@ -17,10 +17,13 @@ unsigned long time_last_baseloop;
 unsigned long frequency = 0;
 float power = 0.0;
 String mode_str = "";
+String ptt_str = "";
+
 
 unsigned long old_frequency = 0;
 float old_power = 0.0;
 String old_mode_str = "";
+String old_ptt_str = "";
 
 // ICOM coms variables
 const byte TERM_address(0xE0); // Identifies the terminal (ESP32)
@@ -55,9 +58,11 @@ int dataIndex = 0;                 // Pointer into the data array
 bool newData2 = false;             // Set to true when a new data-array has been received
 const uint8_t qrg_query[] = {0x03};
 const uint8_t mode_query[] = {0x04};
+const uint8_t ptt_query[] = {0x1C, 0x00};
 const uint8_t power_query[] = {0x14, 0x0A};
 size_t qrg_query_length = sizeof(qrg_query) / sizeof(qrg_query[0]);
 size_t mode_query_length = sizeof(mode_query) / sizeof(mode_query[0]);
+size_t ptt_query_length = sizeof(ptt_query) / sizeof(ptt_query[0]);
 size_t power_query_length = sizeof(power_query) / sizeof(power_query[0]);
 
 String buffer;
@@ -105,6 +110,10 @@ void getqrg() {
 
 void getmode() {
   sendCIVQuery(mode_query, mode_query_length);
+}
+
+void getptt() {
+  sendCIVQuery(ptt_query, ptt_query_length);
 }
 
 void geticomdata() {
@@ -179,6 +188,18 @@ void calculateMode() {
   }
 }
 
+void calculatePTT() {
+  uint8_t ptt_int = receivedData[3];
+  switch (ptt_int) {
+      case 0:
+      ptt_str = "RX";
+      break;
+    case 1:
+      ptt_str = "TX";
+      break;
+  }
+}
+
 void processReceivedData(void) {
   // first of all starting with the received command as debug on serial console output (e.g. Arduino Serial Monitor)
   Serial.print(F("RX: "));
@@ -200,12 +221,12 @@ void processReceivedData(void) {
         calculateMode();
         break;
       }
-      case 0x3: { // reply to terminal on query
-        calculateQRG();
+      case 0x1C: { // reply to terminal on query
+        calculatePTT();
         break;
       }
-      case 0x4: { // reply to terminal on query
-        calculateMode();
+      case 0x3: { // reply to terminal on query
+        calculateQRG();
         break;
       }
       case 0x14: {
@@ -216,11 +237,12 @@ void processReceivedData(void) {
   }
 }
 
-void create_json(unsigned long frequency, String mode, float power) {  
+void create_json(unsigned long frequency, String mode, String ptt, float power) {  
   jsonDoc.clear();  
   jsonDoc["radio"] = String(civ_options[params[3].toInt()][1]) + " Wavelog CI-V";
   jsonDoc["frequency"] = frequency;
   jsonDoc["mode"] = mode;
+  jsonDoc["ptt"] = ptt;
   jsonDoc["power"] = power;
   jsonDoc["downlink_freq"] = 0;
   jsonDoc["uplink_freq"] = 0;
@@ -247,6 +269,7 @@ void post_json() {
       String response = http.getString();
       Serial.println(response);
       old_mode_str = mode_str;
+      old_ptt_str = ptt_str;
       old_frequency = frequency;
       old_power = power;
     } else {
@@ -353,10 +376,16 @@ String rig_get_mode() {
   return mode_str;
 }
 
+String rig_get_ptt() {
+  return ptt_str;
+}
 void handleRPC() {
   // processing XML-RPC-request
   if (XMLRPCserver.arg(0).indexOf("<methodName>rig.get_vfo</methodName>") != -1) {
     String response = rig_get_vfo();
+    XMLRPCserver.send(200, "text/xml", "<methodResponse><params><param><value>" + response + "</value></param></params></methodResponse>");
+  } else if (XMLRPCserver.arg(0).indexOf("<methodName>rig.get_ptt</methodName>") != -1) {
+    String response = rig_get_ptt();
     XMLRPCserver.send(200, "text/xml", "<methodResponse><params><param><value>" + response + "</value></param></params></methodResponse>");
   } else if (XMLRPCserver.arg(0).indexOf("<methodName>rig.get_mode</methodName>") != -1) {
     String response = rig_get_mode();
@@ -425,7 +454,15 @@ void setup() {
       processReceivedData();
     }
     newData2 = false;
-    create_json(frequency, mode_str, power);
+    delay(1000);
+    getptt();
+    if (params[3].toInt() >= 0) 
+      geticomdata();
+    if (newData2) {
+      processReceivedData();
+    }
+    newData2 = false;
+    create_json(frequency, mode_str, ptt_str, power);
     post_json();
   }
 }
@@ -450,9 +487,9 @@ void loop() {
     newData2 = false;
   
     delay(10); 
-    if ( mode_str != old_mode_str || frequency != old_frequency || power != old_power) {
+    if ( mode_str != old_mode_str || frequency != old_frequency || ptt_str != old_ptt_str || power != old_power) {
       // send json to server
-      create_json(frequency, mode_str, power);
+      create_json(frequency, mode_str, ptt_str, power);
       post_json();
     }
   } else {
