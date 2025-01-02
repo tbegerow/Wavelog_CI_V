@@ -189,13 +189,13 @@ void calculateMode() {
 }
 
 void calculatePTT() {
-  uint8_t ptt_int = receivedData[3];
+  uint8_t ptt_int = receivedData[4];
   switch (ptt_int) {
       case 0:
-      ptt_str = "RX";
+      ptt_str = "rx";
       break;
     case 1:
-      ptt_str = "TX";
+      ptt_str = "tx";
       break;
   }
 }
@@ -379,6 +379,7 @@ String rig_get_mode() {
 String rig_get_ptt() {
   return ptt_str;
 }
+
 void handleRPC() {
   // processing XML-RPC-request
   if (XMLRPCserver.arg(0).indexOf("<methodName>rig.get_vfo</methodName>") != -1) {
@@ -476,9 +477,10 @@ void loop() {
     //query tx-power every 5 secs
     if ((time_current_baseloop - time_last_baseloop) > BASELOOP_TICK) {
       getpower();
+//      getptt(); // testing ptt-query 
       time_last_baseloop = time_current_baseloop;
     }
-    
+      
     if (params[3].toInt() >= 0) 
       geticomdata();
     if (newData2) {
