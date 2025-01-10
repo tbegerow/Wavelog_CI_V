@@ -4,7 +4,10 @@
 #include <WebServer.h>
 #include <SPIFFS.h>
 #include <ESPmDNS.h>
+#include <AsyncTCP.h>
 
+const char* html_username = "sysop";
+const char* html_password = "admin";
 const int numParams = 4; // number of  parameters
 String params[numParams] = {"", "", "", ""}; // initialization of parameters
 WebServer server(80);
@@ -280,6 +283,9 @@ void post_json() {
 }
 
 void handleRoot() {
+    if (!server.authenticate(html_username, html_password)) {
+    return server.requestAuthentication();
+  }
   String html = "<!DOCTYPE html>";
   html += "<html>";
   html += "<head>";
@@ -321,11 +327,52 @@ void handleRoot() {
   html += "<form action='/reboot' method='post'>";
   html += "<button type='submit' class='btn-reboot'>Reboot ESP32</button>";
   html += "</form>";
+  html += "<form action='/logout' method='post'>";
+  html += "<button type='submit' class='btn-logout'>Logout</button>";
+  // html += "<button onclick="logoutButton()">Logout</button>"
+  html += "</form>";
   html += "</div>";
   html += "</body>";
   html += "</html>";
 
   server.send(200, "text/html", html);
+}
+
+void handleLogout() {
+  server.send(401);
+}
+  
+void handleLoggedout() {
+  String html = "<!DOCTYPE html>";
+  html += "<html>";
+  html += "<head>";
+  html += "<meta charset=\"UTF-8\">";
+  html += "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">";
+  html += "<title>ESP32 Configuration Logout</title>";
+  html += "<style>";
+  html += "body { font-family: Arial, sans-serif; }";
+  html += ".container { max-width: 400px; margin: 0 auto; padding: 20px; }";
+  html += "input[type='text'] { width: 100%; padding: 10px; margin: 5px 0; }";
+  html += "input[type='submit'] { width: 100%; padding: 10px; margin-top: 10px; background-color: #4CAF50; color: white; border: none; }";
+  html += ".btn-reboot { width: 100%; padding: 10px; margin-top: 10px; background-color: #FF0000; color: white; border: none; }";
+  html += "input[type='submit']:hover { background-color: #45a049; }";
+  html += "</style>";
+  html += "</head>";
+  html += "<body>";
+  html += "<div class=\"container\">";
+  html += "<h1>Logout</h1>";
+  html += "<form action='/' method='post'>";
+  html += "<button type='submit' class='btn'>Return to Homepage</button>";
+  html += "</form>";
+  html += "</div>";
+  html += "</body>";
+  html += "</html>";
+
+  server.send(200, "text/html", html);
+}
+
+void handle_NotFound(){
+  server.send(404, "text/plain", "Not found");
 }
 
 void loadParametersFromSPIFFS() {
@@ -424,9 +471,12 @@ void setup() {
   Serial.print(F("IP-Address: "));
   Serial.println(WiFi.localIP());
 
-  server.on("/", handleRoot);
+  server.on("/", HTTP_GET, handleRoot);
   server.on("/save", handleSave);
   server.on("/reboot", handleReboot);
+  server.on("/logout", HTTP_GET, handleLogout, handleLoggedout);
+  server.on("/logged-out", HTTP_GET, handleLoggedout);
+  server.onNotFound(handle_NotFound);
   server.begin();
   Serial.println("HTTP server started");
 
