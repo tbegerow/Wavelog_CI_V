@@ -10,9 +10,12 @@
 #include <ESPmDNS.h>
 #include <AsyncTCP.h>
 #include <WebSocketsServer.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
 
 // --------------------- DEBUG SYSTEM ---------------------
-#define DEBUG_LEVEL 2     // 0=none, 1=normal, 2=Debug++ (human readable)
+#define DEBUG_LEVEL 1     // 0=none, 1=normal, 2=Debug++ (human readable)
 #define MAX_LOG_LINES 500
 String debugLog[MAX_LOG_LINES];
 int debugIndex = 0;
@@ -52,6 +55,13 @@ unsigned long time_last_baseloop;
 unsigned long time_last_update;
 #define BASELOOP_TICK 5000 // = 5 seconds
 #define DEBOUNCE_TIME 1500 // = 1,5sec. process ONLY if TRX has settled
+
+// define 0.96" SDD1306 display
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+unsigned long lastOLED = 0;
+const unsigned long OLED_UPDATE_INTERVAL = 500; // ms
 
 unsigned long frequency = 0;
 float power = 0.0;
@@ -269,6 +279,50 @@ void processReceivedData(void) {
   } else {
     LOG2("Frame not for us");
   }
+}
+
+// ---------------- Display update ----------------
+// updates the SSD1306 display with QRG/Mode/PWR and RX/TX-dot
+void updateDisplay() {
+  // throttle updates to avoid excessive writes
+  if (millis() - lastOLED < OLED_UPDATE_INTERVAL) return;
+  lastOLED = millis();
+
+  display.clearDisplay();
+
+  // Draw RX/TX dot at top-right: filled circle = TX, outline = RX
+  if (ptt_state) {
+    display.fillCircle(120, 8, 5, SSD1306_WHITE); // TX = filled (red simulated)
+  } else {
+    display.drawCircle(120, 8, 5, SSD1306_WHITE); // RX = outline (green simulated)
+  }
+
+  // Big RX/TX label
+  display.setTextSize(2);
+  display.setCursor(0, 0);
+  if (ptt_state) display.print("TX"); else display.print("RX");
+
+  // Frequency, Mode, Power lines
+  display.setTextSize(1);
+
+  // Format frequency as MHz with 3 decimals
+  float mhz = frequency / 1000000.0;
+  String qrgStr = String(mhz, 3) + " MHz";
+
+  display.setCursor(0, 28);
+  display.print("QRG: ");
+  display.print(qrgStr);
+
+  display.setCursor(0, 40);
+  display.print("Mode: ");
+  display.print(mode_str);
+
+  display.setCursor(0, 52);
+  display.print("PWR: ");
+  display.print(String(power, 1));
+  display.print(" W");
+
+  display.display();
 }
 
 // ---------------- JSON / HTTP / XMLRPC ----------------
@@ -655,6 +709,21 @@ void setup() {
     return;
   }
   
+  Wire.begin(21, 22);
+
+  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+  Serial.println("SSD1306 allocation failed");
+  for(;;); // stop forever
+  } else {
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 0);
+    display.println("Wavelog CI-V Booting...");
+    display.display();
+    delay(1500);
+  }
+
   loadParametersFromSPIFFS();
 
   LOG1(String("URL: ") + params[0]);
@@ -761,12 +830,18 @@ void loop() {
       time_last_update = millis();
       processReceivedData();
       newData2 = false;
+
+      // update display immediately after new CI-V data processed
+      updateDisplay();
     }
   // Debug-Output every second
     if (millis() - lastDebug > 1000) {
       LOG2(String("[DBG] QRG: ") + String(frequency) + " | MODE: " + mode_str + " | PTT: " + ptt_str + " | PWR: " + String(power));
       lastDebug = millis();
     }
+
+    // periodic display refresh (if no new CI-V frames)
+    updateDisplay();
 
     if (( mode_str != old_mode_str || frequency != old_frequency || ptt_str != old_ptt_str || power != old_power) && ((time_current_baseloop-time_last_update)>DEBOUNCE_TIME)) {
       // send json to server
