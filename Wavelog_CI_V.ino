@@ -63,6 +63,10 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 unsigned long lastOLED = 0;
 const unsigned long OLED_UPDATE_INTERVAL = 500; // ms
 
+// define state led for ptt-state
+#define LED_TX 26
+#define LED_RX 27
+
 unsigned long frequency = 0;
 float power = 0.0;
 String mode_str = "";
@@ -232,6 +236,8 @@ void calculatePTT() {
       if (ptt_str != "rx") {
         ptt_str = "rx";
         ptt_state = false;
+        digitalWrite(LED_TX, LOW);
+        digitalWrite(LED_RX, HIGH);
         LOG1("PTT state updated: RX (0)");
       }
       break;
@@ -239,6 +245,8 @@ void calculatePTT() {
       if (ptt_str != "tx") {
         ptt_str = "tx";
         ptt_state = true;
+        digitalWrite(LED_TX, HIGH);
+        digitalWrite(LED_RX, LOW);
         LOG1("PTT state updated: TX (1)");
       }
       break;
@@ -282,48 +290,60 @@ void processReceivedData(void) {
 }
 
 // ---------------- Display update ----------------
-// updates the SSD1306 display with QRG/Mode/PWR and RX/TX-dot
+// updates the SSD1306 display with QRG/Mode/PWR and RX/TX-dot and IP
 void updateDisplay() {
-  // throttle updates to avoid excessive writes
   if (millis() - lastOLED < OLED_UPDATE_INTERVAL) return;
   lastOLED = millis();
 
   display.clearDisplay();
 
-  // Draw RX/TX dot at top-right: filled circle = TX, outline = RX
+  // RX/TX dot top-right
   if (ptt_state) {
-    display.fillCircle(120, 8, 5, SSD1306_WHITE); // TX = filled (red simulated)
+    display.fillCircle(120, 6, 4, SSD1306_WHITE);  // TX = filled (red simulated)
   } else {
-    display.drawCircle(120, 8, 5, SSD1306_WHITE); // RX = outline (green simulated)
+    display.drawCircle(120, 6, 4, SSD1306_WHITE);  // RX = outline (green simulated)
   }
 
-  // Big RX/TX label
-  display.setTextSize(2);
-  display.setCursor(0, 0);
+  // Small RX/TX text
+  display.setTextSize(1);
+  display.setCursor(98, 0);
   if (ptt_state) display.print("TX"); else display.print("RX");
 
-  // Frequency, Mode, Power lines
+  // QRG, Mode, Power
   display.setTextSize(1);
 
-  // Format frequency as MHz with 3 decimals
   float mhz = frequency / 1000000.0;
   String qrgStr = String(mhz, 3) + " MHz";
 
-  display.setCursor(0, 28);
+  display.setCursor(0, 14);
   display.print("QRG: ");
   display.print(qrgStr);
 
-  display.setCursor(0, 40);
+  display.setCursor(0, 26);
   display.print("Mode: ");
   display.print(mode_str);
 
-  display.setCursor(0, 52);
+  display.setCursor(0, 38);
   display.print("PWR: ");
   display.print(String(power, 1));
   display.print(" W");
 
+  display.setCursor(0, 54);
+  display.print("IP: ");
+  display.print(WiFi.localIP().toString());
+
   display.display();
+
+  // LED sync as backup
+  if (ptt_state) {
+    digitalWrite(LED_TX, HIGH);
+    digitalWrite(LED_RX, LOW);
+  } else {
+    digitalWrite(LED_TX, LOW);
+    digitalWrite(LED_RX, HIGH);
+  }
 }
+
 
 // ---------------- JSON / HTTP / XMLRPC ----------------
 void create_json(unsigned long frequency, String mode, String ptt, float power) {  
@@ -724,6 +744,13 @@ void setup() {
     delay(1500);
   }
 
+  pinMode(LED_RX, OUTPUT);
+  pinMode(LED_TX, OUTPUT);
+
+  // Initialstatus: RX = grün
+  digitalWrite(LED_RX, HIGH);
+  digitalWrite(LED_TX, LOW);
+
   loadParametersFromSPIFFS();
 
   LOG1(String("URL: ") + params[0]);
@@ -733,6 +760,14 @@ void setup() {
   connectToWifi();
 
   LOG1(String("IP-Address: ") + WiFi.localIP().toString());
+
+  // --- Initial CI-V read at startup ---
+  delay(200);   // small delay to let CI-V settle
+  getmode();    // read mode immediately
+  getpower();   // read power immediately
+  getptt();     // get PTT state at startup
+  updateDisplay();  // immediate display refresh
+  time_last_baseloop = millis();   // reset timer to avoid double polling
 
   server.on("/", HTTP_GET, handleRoot);
   server.on("/trx", HTTP_GET, handleTrx);
