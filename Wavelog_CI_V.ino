@@ -13,36 +13,53 @@
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include <Preferences.h>
 
-// --------------------- DEBUG SYSTEM ---------------------
-#define DEBUG_LEVEL 1     // 0=none, 1=normal, 2=Debug++ (human readable)
+// --------------------- CONFIG / DEBUG ---------------------
+#define DEBUG_WS 1                     // WebSocket debug broadcast enabled (1 = allow broadcast when level >=1)
+#define DEFAULT_DEBUG_LEVEL 1          // 0=off, 1=normal, 2=Debug++
+int debugLevel = DEFAULT_DEBUG_LEVEL;  // runtime variable (persisted to Preferences)
+Preferences prefs;
+
 #define MAX_LOG_LINES 500
 String debugLog[MAX_LOG_LINES];
 int debugIndex = 0;
 
+// WebSocket
 WebSocketsServer webSocket = WebSocketsServer(81); // WebSocket-Server on Port 81
 
+// --------------------- Debug functions ---------------------
 void addDebugRaw(const String &msg) {
   debugLog[debugIndex] = msg;
   debugIndex = (debugIndex + 1) % MAX_LOG_LINES;
 }
 
-void broadcastDebug(String msg) {
-  // send to websocket clients immediately if any connected
-  // webSocket.broadcastTXT exists in the library
-  webSocket.broadcastTXT(msg);
+void broadcastDebug(const String &s) {
+  // WebSocketsServer::broadcastTXT requires a non-const String&, so make a mutable copy
+  String tmp = s;
+  webSocket.broadcastTXT(tmp);
 }
 
 void addDebugPrint(const String &msg) {
-  if (DEBUG_LEVEL > 0) Serial.println(msg);
+  // Always store log
   addDebugRaw(msg);
-  if (DEBUG_LEVEL > 0) broadcastDebug(msg);
+
+  // Serial output only when debugLevel >= 1
+  if (debugLevel >= 1) {
+    Serial.println(msg);
+  }
+
+  // Broadcast to WS clients if allowed and debugLevel >= 1
+  if (DEBUG_WS && debugLevel >= 1) {
+    broadcastDebug(msg);
+  }
 }
 
-#define LOG1(msg) if (DEBUG_LEVEL >= 1) addDebugPrint(msg)
-#define LOG2(msg) if (DEBUG_LEVEL >= 2) addDebugPrint(msg)
+#define LOG1(msg) if (debugLevel >= 1) addDebugPrint(msg)
+#define LOG2(msg) if (debugLevel >= 2) addDebugPrint(msg)
 // --------------------- end Debug ------------------------
 
+// ---------------- Web / params / servers ------------------
 const char* html_username = "sysop";  // Webif username
 const char* html_password = "admin";  // Webif password
 const int numParams = 4; // number of  parameters
@@ -50,6 +67,7 @@ String params[numParams] = {"", "", "", ""}; // initialization of parameters
 WebServer server(80);
 WebServer XMLRPCserver(12345);
 
+// ---------------- timing / constants ---------------------
 unsigned long time_current_baseloop;
 unsigned long time_last_baseloop;
 unsigned long time_last_update;
@@ -88,27 +106,27 @@ const byte TERM_address(0xE0); // Identifies the terminal (ESP32)
 const byte startMarker = 0xFE;  // Indicates where the icom signal string starts
 const byte endMarker = 0xFD;    // Indicates where the icom signal string ends
 
- const char* civ_options[][2] = { // List of names for select-options in config-page
-    {"0", "IC-7300 (94h)"},
-    {"1", "IC-7200 (76h)"},
-    {"2", "IC-7100 (88h)"},
-    {"3", "IC-7000 (70h)"},
-    {"4", "IC-7410 (80h)"},
-    {"5", "IC-9100 (7Ch)"},
-    {"6", "IC-9700 (A2h)"},
-    {"7", "ID-5100 (8Ch)"}
-  };
+const char* civ_options[][2] = { // List of names for select-options in config-page
+  {"0", "IC-7300 (94h)"},
+  {"1", "IC-7200 (76h)"},
+  {"2", "IC-7100 (88h)"},
+  {"3", "IC-7000 (70h)"},
+  {"4", "IC-7410 (80h)"},
+  {"5", "IC-9100 (7Ch)"},
+  {"6", "IC-9700 (A2h)"},
+  {"7", "ID-5100 (8Ch)"}
+};
 
 const byte civ_addresses[] = { // corresponding list of CI-V-Adresses to list above
-    0x94,
-    0x76,
-    0x88,
-    0x70,
-    0x80,
-    0x7C,
-    0xA2,
-    0x8C
-  };
+  0x94,
+  0x76,
+  0x88,
+  0x70,
+  0x80,
+  0x7C,
+  0xA2,
+  0x8C
+};
 
 const int maxDataLength = 16;
 byte receivedData[maxDataLength];  // Array for the recieved data bytes
@@ -175,10 +193,9 @@ void geticomdata() {
 
 // ---------------- utility ----------------
 int bcd2Dec(int bcdValue) {
-    int units = bcdValue & 0xF;  // lower 4 bits
-    int tens = (bcdValue >> 4) & 0xF;  // upper 4 bits
-
-    return tens * 10 + units;
+  int units = bcdValue & 0xF;  // lower 4 bits
+  int tens = (bcdValue >> 4) & 0xF;  // upper 4 bits
+  return tens * 10 + units;
 }
 
 void logReceivedHex() {
@@ -194,14 +211,13 @@ void logReceivedHex() {
 
 // ---------------- parsers ----------------
 void calculateQRG() {
-  uint8_t GHZ = 0, MHZ = 0, KHZ = 0, HZ = 0, mHZ = 0;
+  uint8_t GHZ = 0, MHZ = 0, KHZ = 0, HZ = 0;
   uint32_t t_QRG = 0;
   GHZ = bcd2Dec(receivedData[7]);           // 1GHz & 100Mhz
   MHZ = bcd2Dec(receivedData[6]);           // 10Mhz & 1Mhz
   KHZ = bcd2Dec(receivedData[5]);           // 100Khz & 10KHz
-  HZ = bcd2Dec(receivedData[4]);         // 1Khz & 100Hz
-  
-  t_QRG = ((GHZ * 1000000) + (MHZ * 10000) + (KHZ * 100) + (HZ * 1));  // QRG variable stores frequency in GMMMkkkH format - Frequ divided by 100
+  HZ = bcd2Dec(receivedData[4]);            // 1Khz & 100Hz
+  t_QRG = ((GHZ * 1000000) + (MHZ * 10000) + (KHZ * 100) + (HZ * 1));
   frequency = t_QRG*100;
   LOG2(String("calculateQRG -> ") + String(frequency));
 }
@@ -219,6 +235,7 @@ void calculateMode() {
     case 7: mode_str = "CW"; break;
     case 8: mode_str = "RTTY"; break;
     case 23: mode_str = "DSTAR"; break;
+    default: mode_str = "UNK"; break;
   }
   LOG2(String("Mode parsed -> ") + mode_str);
 }
@@ -230,7 +247,7 @@ void calculatePTT() {
     return;
   }
 
-  uint8_t ptt_int = receivedData[4]; // many ICOMs use byte 5 (index 4) or 6; this is your current mapping
+  uint8_t ptt_int = receivedData[4];
   switch (ptt_int) {
     case 0:
       if (ptt_str != "rx") {
@@ -249,6 +266,9 @@ void calculatePTT() {
         digitalWrite(LED_RX, LOW);
         LOG1("PTT state updated: TX (1)");
       }
+      break;
+    default:
+      // unknown value: ignore
       break;
   }
 }
@@ -344,7 +364,6 @@ void updateDisplay() {
   }
 }
 
-
 // ---------------- JSON / HTTP / XMLRPC ----------------
 void create_json(unsigned long frequency, String mode, String ptt, float power) {  
   jsonDoc.clear();  
@@ -389,6 +408,7 @@ void handleRoot() {
   if (!server.authenticate(html_username, html_password)) {
     return server.requestAuthentication();
   }
+
   String html = "<!DOCTYPE html>";
   html += "<html>";
   html += "<head>";
@@ -431,25 +451,52 @@ void handleRoot() {
   html += "<form action='/reboot' method='post'>";
   html += "<button type='submit' class='btn-reboot'>Reboot ESP32</button>";
   html += "</form>";
+
+  // Debug-level selector
+  html += "<h3>Debug Level</h3>";
+  html += "<select id='debugLevelSelect'>";
+  html += "<option value='0'" + String((debugLevel==0) ? " selected" : "") + ">0 = OFF</option>";
+  html += "<option value='1'" + String((debugLevel==1) ? " selected" : "") + ">1 = NORMAL</option>";
+  html += "<option value='2'" + String((debugLevel==2) ? " selected" : "") + ">2 = DEBUG++</option>";
+  html += "</select>";
+  html += "<button onclick='setDebugLevel()'>Set</button>";
+  html += "<p id='debugSetResult'></p>";
+
   html += "<p><a href='/debug'>Debug (page)</a> | <a href='/debugws'>Debug WS (live)</a></p>";
   html += "<form action='/logged-out' method='post'>";
   html += "<button type='submit' class='btn-logout'>Logout</button>";
   html += "</form>";
   html += "</div>";
+
+  // JS: polling + debug-level setter
   html += "<script>";
   html += R"JS(
-  setInterval(function() {
-    fetch('/trx')
-      .then(response => response.json())
-      .then(data => {
-        document.getElementById('qrg').textContent = (data.qrg/1000) + ' kHz';
-        document.getElementById('mode').textContent = data.mode;
-        document.getElementById('ptt').textContent = (data.ptt === 'tx') ? '🔴 TX' : '🟢 RX';
-      })
-      .catch(error => {
-        console.error('Fetch error:', error);
-      });
-  }, 1000);
+    function refreshTrx() {
+      fetch('/trx')
+        .then(response => response.json())
+        .then(data => {
+          document.getElementById('qrg').textContent = (data.qrg/1000) + ' kHz';
+          document.getElementById('mode').textContent = data.mode;
+          document.getElementById('ptt').textContent = (data.ptt === 'tx') ? '🔴 TX' : '🟢 RX';
+        })
+        .catch(error => {
+          console.error('Fetch error:', error);
+        });
+    }
+    setInterval(refreshTrx, 1000);
+    refreshTrx();
+
+    function setDebugLevel() {
+      var lvl = document.getElementById('debugLevelSelect').value;
+      fetch('/setDebug?level=' + lvl)
+        .then(r => r.json())
+        .then(j => {
+          document.getElementById('debugSetResult').textContent = 'Set debug level to ' + j.level;
+        })
+        .catch(e => {
+          document.getElementById('debugSetResult').textContent = 'Error setting debug level';
+        });
+    }
   )JS";
   html += "</script></body></html>";
 
@@ -462,40 +509,17 @@ void handleLogout() {
 
 // handle /trx used by root page
 void handleTrx() {
-  jsonDoc.clear();  
+  jsonDoc.clear();
   jsonDoc["qrg"] = frequency;
   jsonDoc["mode"] = mode_str;
+  jsonDoc["power"] = power;
   jsonDoc["ptt"] = ptt_str;
   serializeJson(jsonDoc, buffer);
   server.send(200, "application/json", buffer);
 }
 
 void handleLoggedout() {
-  String html = "<!DOCTYPE html>";
-  html += "<html>";
-  html += "<head>";
-  html += "<meta charset=\"UTF-8\">";
-  html += "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">";
-  html += "<title>ESP32 Configuration Logout</title>";
-  html += "<style>";
-  html += "body { font-family: Arial, sans-serif; }";
-  html += ".container { max-width: 400px; margin: 0 auto; padding: 20px; }";
-  html += "input[type='text'] { width: 100%; padding: 10px; margin: 5px 0; }";
-  html += "input[type='submit'] { width: 100%; padding: 10px; margin-top: 10px; background-color: #4CAF50; color: white; border: none; }";
-  html += ".btn-reboot { width: 100%; padding: 10px; margin-top: 10px; background-color: #FF0000; color: white; border: none; }";
-  html += "input[type='submit']:hover { background-color: #45a049; }";
-  html += "</style>";
-  html += "</head>";
-  html += "<body>";
-  html += "<div class=\"container\">";
-  html += "<h1>Logout</h1>";
-  html += "<form action='/' method='post'>";
-  html += "<button type='submit' class='btn'>Return to Homepage</button>";
-  html += "</form>";
-  html += "</div>";
-  html += "</body>";
-  html += "</html>";
-
+  String html = "<!DOCTYPE html><html><head><meta charset=\"UTF-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\"><title>ESP32 Configuration Logout</title></head><body><div><h1>Logout</h1><form action='/' method='post'><button type='submit'>Return to Homepage</button></form></div></body></html>";
   server.send(200, "text/html", html);
 }
 
@@ -503,8 +527,34 @@ void handle_NotFound(){
   server.send(404, "text/plain", "Not found");
 }
 
+// Endpoint to set debug level and persist it
+void handleSetDebug() {
+  if (!server.authenticate(html_username, html_password)) {
+    return server.requestAuthentication();
+  }
+
+  if (!server.hasArg("level")) {
+    server.send(400, "application/json", "{\"error\":\"missing level\"}");
+    return;
+  }
+
+  int lvl = server.arg("level").toInt();
+  if (lvl < 0) lvl = 0;
+  if (lvl > 2) lvl = 2;
+
+  debugLevel = lvl;
+  prefs.putInt("debugLevel", debugLevel); // persist
+
+  String resp = "{\"level\": " + String(debugLevel) + "}";
+  LOG1(String("Debug level set to ") + String(debugLevel));
+  server.send(200, "application/json", resp);
+}
+
 // Debug page (plain log)
 void handleDebugPage() {
+  if (!server.authenticate(html_username, html_password)) {
+    return server.requestAuthentication();
+  }
   String html = "<!DOCTYPE html><html><head><meta charset='utf-8'><title>ESP32 Debug Log</title>";
   html += "<style>body{font-family:monospace;background:#000;color:#0f0;padding:10px;white-space:pre-wrap}</style></head><body>";
   html += "<h3>ESP32 Debug Log (last " + String(MAX_LOG_LINES) + " lines)</h3>\n";
@@ -521,6 +571,9 @@ void handleDebugPage() {
 
 // Live WebSocket Debug page (connects to ws://<ip>:81)
 void handleDebugWSPage() {
+  if (!server.authenticate(html_username, html_password)) {
+    return server.requestAuthentication();
+  }
   String html = "<!DOCTYPE html><html><head><meta charset='utf-8'><title>Live Debug Console</title>";
   html += "<style>body{font-family:monospace;background:#000;color:#0f0;padding:10px}#log{height:70vh;overflow:auto;border:1px solid #444;padding:5px;background:#050505}</style></head><body>";
   html += "<h3>Live Debug Console (WebSocket)</h3>";
@@ -529,8 +582,7 @@ void handleDebugWSPage() {
   html += R"JS(
 <script>
 let host = location.hostname;
-let port = 81;
-let ws = new WebSocket('ws://' + host + ':' + port + '/');
+let ws = new WebSocket('ws://' + host + ':81/');
 let log = document.getElementById('log');
 ws.onopen = function() {
   log.appendChild(document.createTextNode('[WS] connected\n'));
@@ -555,6 +607,38 @@ function sendCmd(cmd) {
   server.send(200, "text/html", html);
 }
 
+// ---------------- WebSocket event handler ----------------
+void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
+  if (type == WStype_TEXT) {
+    String msg = String((char*)payload);
+    LOG2(String("WS RX from client ") + String(num) + ": " + msg);
+    if (msg == "clear") {
+      // clear server buffer
+      for (int i = 0; i < MAX_LOG_LINES; ++i) debugLog[i] = "";
+      debugIndex = 0;
+      webSocket.sendTXT(num, "Server log cleared");
+    } else if (msg == "last") {
+      // send last N lines (up to MAX_LOG_LINES)
+      int idx = debugIndex;
+      for (int i = 0; i < MAX_LOG_LINES; ++i) {
+        String line = debugLog[idx];
+        if (line.length() > 0) webSocket.sendTXT(num, line);
+        idx = (idx + 1) % MAX_LOG_LINES;
+      }
+      webSocket.sendTXT(num, "[END OF LOG]");
+    } else {
+      webSocket.sendTXT(num, "Unknown command: " + msg);
+    }
+  } else if (type == WStype_CONNECTED) {
+    IPAddress ip = webSocket.remoteIP(num);
+    LOG1(String("WebSocket client connected: ") + ip.toString());
+    webSocket.sendTXT(num, "Welcome to ESP32 Debug WebSocket");
+  } else if (type == WStype_DISCONNECTED) {
+    LOG1(String("WebSocket client disconnected #") + String(num));
+  }
+}
+
+// ---------------- SPIFFS params IO ----------------
 void loadParametersFromSPIFFS() {
   for (int i = 0; i < numParams; ++i) {
     File file = SPIFFS.open("/param" + String(i) + ".txt", "r");
@@ -580,6 +664,10 @@ void saveParametersToSPIFFS() {
 }
 
 void handleSave() {
+  if (!server.authenticate(html_username, html_password)) {
+    return server.requestAuthentication();
+  }
+
   params[0] = server.arg("wavelogUrl");
   params[1] = server.arg("wavelogApiEndpoint");
   params[2] = server.arg("wavelogApiKey");
@@ -592,7 +680,7 @@ void handleSave() {
 }
 
 void handleReboot() {
-    ESP.restart();
+  ESP.restart();
 }
 
 String rig_get_vfo() {
@@ -607,6 +695,7 @@ String rig_get_ptt() {
   return ptt_str;
 }
 
+// ---------------- XML-RPC handling ----------------
 void handleRPC() {
   // DEBUG Trace
   LOG2("=== Incoming RPC Request ===");
@@ -682,43 +771,16 @@ void handleRPC() {
   }
 }
 
-// WebSocket event handler
-void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
-  if (type == WStype_TEXT) {
-    String msg = String((char*)payload);
-    LOG2(String("WS RX from client ") + String(num) + ": " + msg);
-    if (msg == "clear") {
-      // clear server buffer
-      for (int i = 0; i < MAX_LOG_LINES; ++i) debugLog[i] = "";
-      debugIndex = 0;
-      webSocket.sendTXT(num, "Server log cleared");
-    } else if (msg == "last") {
-      // send last N lines (up to MAX_LOG_LINES)
-      int idx = debugIndex;
-      for (int i = 0; i < MAX_LOG_LINES; ++i) {
-        String line = debugLog[idx];
-        if (line.length() > 0) webSocket.sendTXT(num, line);
-        idx = (idx + 1) % MAX_LOG_LINES;
-      }
-      webSocket.sendTXT(num, "[END OF LOG]");
-    } else {
-      webSocket.sendTXT(num, "Unknown command: " + msg);
-    }
-  } else if (type == WStype_CONNECTED) {
-    IPAddress ip = webSocket.remoteIP(num);
-    LOG1(String("WebSocket client connected: ") + ip.toString());
-    webSocket.sendTXT(num, "Welcome to ESP32 Debug WebSocket");
-  } else if (type == WStype_DISCONNECTED) {
-    LOG1(String("WebSocket client disconnected #") + String(num));
-  }
-}
-
 // ---------------- Setup ----------------
-
 void setup() {
   Serial.begin(115200);  // Serial console
   Serial2.begin(19200, SERIAL_8N1, 16, 17);  // ICOM CI-V
   delay(1000);
+
+  // Preferences init and load persisted debug level
+  prefs.begin("wlog", false);
+  debugLevel = prefs.getInt("debugLevel", DEFAULT_DEBUG_LEVEL);
+  LOG1(String("Loaded debug level: ") + String(debugLevel));
 
   LOG1("");
   LOG1("Booting Sketch...");
@@ -732,8 +794,8 @@ void setup() {
   Wire.begin(21, 22);
 
   if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
-  Serial.println("SSD1306 allocation failed");
-  for(;;); // stop forever
+    Serial.println("SSD1306 allocation failed");
+    for(;;); // stop forever
   } else {
     display.clearDisplay();
     display.setTextSize(1);
@@ -777,20 +839,14 @@ void setup() {
   server.on("/logged-out", HTTP_GET, handleLoggedout);
   server.onNotFound(handle_NotFound);
 
+  // Debug Live WebSocket page
+  server.on("/debugws", HTTP_GET, handleDebugWSPage);
+
+  // Endpoint to set debug level
+  server.on("/setDebug", HTTP_GET, handleSetDebug);
+
   // Debug web page (shows last MAX_LOG_LINES log entries)
-  server.on("/debug", HTTP_GET, []() {
-    String html = "<!DOCTYPE html><html><head><meta charset='utf-8'><title>ESP32 Debug Log</title>";
-    html += "<style>body{font-family:monospace;background:#000;color:#0f0;padding:10px;white-space:pre-wrap}</style></head><body>";
-    html += "<h3>ESP32 Debug Log (last " + String(MAX_LOG_LINES) + " lines)</h3>\n";
-    int idx = debugIndex;
-    for (int i = 0; i < MAX_LOG_LINES; ++i) {
-      String line = debugLog[idx];
-      if (line.length() > 0) html += line + "\n";
-      idx = (idx + 1) % MAX_LOG_LINES;
-    }
-    html += "</body></html>";
-    server.send(200, "text/html", html);
-  });
+  server.on("/debug", HTTP_GET, handleDebugPage);
 
   server.begin();
   LOG1("HTTP server started");
@@ -840,9 +896,9 @@ void setup() {
 
 // ---------------- Loop ----------------
 void loop() {
+  webSocket.loop();
   server.handleClient();
   XMLRPCserver.handleClient();
-  webSocket.loop(); //  für WebSocket
 
   if (WiFi.status() == WL_CONNECTED) {
     time_current_baseloop = millis();
@@ -869,7 +925,7 @@ void loop() {
       // update display immediately after new CI-V data processed
       updateDisplay();
     }
-  // Debug-Output every second
+    // Debug-Output every second
     if (millis() - lastDebug > 1000) {
       LOG2(String("[DBG] QRG: ") + String(frequency) + " | MODE: " + mode_str + " | PTT: " + ptt_str + " | PWR: " + String(power));
       lastDebug = millis();
@@ -887,5 +943,6 @@ void loop() {
     LOG1("No connection to your WiFi-network.");
     connectToWifi();
   }
-  delay(5);
+  // allow other tasks without blocking WS
+  vTaskDelay(1);
 } // end loop
