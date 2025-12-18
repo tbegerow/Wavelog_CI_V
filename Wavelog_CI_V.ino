@@ -13,13 +13,12 @@
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
-#include <Preferences.h>
 
 // --------------------- CONFIG / DEBUG ---------------------
 #define DEBUG_WS 1                     // WebSocket debug broadcast enabled (1 = allow broadcast when level >=1)
 #define DEFAULT_DEBUG_LEVEL 1          // 0=off, 1=normal, 2=Debug++
-int debugLevel = DEFAULT_DEBUG_LEVEL;  // runtime variable (persisted to Preferences)
-Preferences prefs;
+int debugLevel = DEFAULT_DEBUG_LEVEL;
+//int debugLevel = params.debuglevel;
 
 #define MAX_LOG_LINES 500
 String debugLog[MAX_LOG_LINES];
@@ -29,27 +28,47 @@ int debugIndex = 0;
 WebSocketsServer webSocket = WebSocketsServer(81); // WebSocket-Server on Port 81
 
 // --------------------- Debug functions ---------------------
+void loadDebugLevel() {
+    if (SPIFFS.exists("/debuglevel.txt")) {
+        File f = SPIFFS.open("/debuglevel.txt", "r");
+        if (f) {
+            debugLevel = f.readString().toInt();
+            f.close();
+        }
+    }
+    if (debugLevel < 0 || debugLevel > 2) debugLevel = 1;
+    Serial.printf("Loaded debug level: %d\n", debugLevel);
+}
+
+void saveDebugLevel() {
+    File f = SPIFFS.open("/debuglevel.txt", "w");
+    if (f) {
+        f.print(debugLevel);
+        f.close();
+    }
+}
+
 void addDebugRaw(const String &msg) {
   debugLog[debugIndex] = msg;
   debugIndex = (debugIndex + 1) % MAX_LOG_LINES;
 }
 
 void broadcastDebug(const String &s) {
-  // WebSocketsServer::broadcastTXT requires a non-const String&, so make a mutable copy
+  // broadcastTXT(String&) → mutable Kopie
   String tmp = s;
   webSocket.broadcastTXT(tmp);
 }
 
 void addDebugPrint(const String &msg) {
-  // Always store log
+  // Immer ins RAM-Log schreiben
   addDebugRaw(msg);
 
-  // Serial output only when debugLevel >= 1
+  // Serial nur wenn >= 1
   if (debugLevel >= 1) {
     Serial.println(msg);
   }
 
-  // Broadcast to WS clients if allowed and debugLevel >= 1
+  // WebSocket nur wenn erlaubt & level >= 1
   if (DEBUG_WS && debugLevel >= 1) {
     broadcastDebug(msg);
   }
@@ -62,8 +81,8 @@ void addDebugPrint(const String &msg) {
 // ---------------- Web / params / servers ------------------
 const char* html_username = "sysop";  // Webif username
 const char* html_password = "admin";  // Webif password
-const int numParams = 4; // number of  parameters
-String params[numParams] = {"", "", "", ""}; // initialization of parameters
+const int numParams = 6; // number of  parameters
+String params[numParams] = {"", "", "", "", "", ""}; // initialization of parameters
 WebServer server(80);
 WebServer XMLRPCserver(12345);
 
@@ -80,10 +99,17 @@ unsigned long time_last_update;
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 unsigned long lastOLED = 0;
 const unsigned long OLED_UPDATE_INTERVAL = 500; // ms
+char qrgBuf[16];
+char pwrBuf[10];
+char ipBuf[20];
+bool oledRotated = false;
 
 // define state led for ptt-state
 #define LED_TX 26
 #define LED_RX 27
+
+uint8_t activeCivAddr = 0x00;
+uint8_t civRadioAddr;
 
 unsigned long frequency = 0;
 float power = 0.0;
@@ -96,12 +122,18 @@ float old_power = 0.0;
 String old_mode_str = "";
 String old_ptt_str = "";
 
+volatile bool civFreqUpdated  = false;
+volatile bool civModeUpdated  = false;
+volatile bool civPowerUpdated = false;
+volatile bool civPTTUpdated   = false;
+
 // Realtime-PTT Query
 unsigned long lastPTTQuery = 0;
 const unsigned long PTT_INTERVAL = 200; // 5x per second
 unsigned long lastDebug = 0;
 
 // ICOM coms variables
+String autodetectedCiv = "";
 const byte TERM_address(0xE0); // Identifies the terminal (ESP32)
 const byte startMarker = 0xFE;  // Indicates where the icom signal string starts
 const byte endMarker = 0xFD;    // Indicates where the icom signal string ends
@@ -128,10 +160,11 @@ const byte civ_addresses[] = { // corresponding list of CI-V-Adresses to list ab
   0x8C
 };
 
-const int maxDataLength = 16;
+const int maxDataLength = 64;
 byte receivedData[maxDataLength];  // Array for the recieved data bytes
 int dataIndex = 0;                 // Pointer into the data array
 bool newData2 = false;             // Set to true when a new data-array has been received
+
 const uint8_t qrg_query[] = {0x03};
 const uint8_t mode_query[] = {0x04};
 const uint8_t ptt_query[] = {0x1C, 0x00};
@@ -143,6 +176,15 @@ size_t power_query_length = sizeof(power_query) / sizeof(power_query[0]);
 
 String buffer;
 DynamicJsonDocument jsonDoc(512);
+
+String civAddrToName(uint8_t addr) {
+  for (int i = 0; civ_options[i][0] != nullptr; i++) {
+    if (strtol(civ_options[i][0], nullptr, 16) == addr) {
+      return String(civ_options[i][1]);
+    }
+  }
+  return String("Unknown CI-V (0x") + String(addr, HEX) + ")";
+}
 
 // ---------------- WiFi connect ----------------
 void connectToWifi() {
@@ -158,16 +200,35 @@ void connectToWifi() {
 }
 
 // ---------------- CI-V send / receive ----------------
+bool civDataValid = false;
+void updateFromCIV() {
+  if (frequency > 0 &&
+      mode_str.length() > 0 &&
+      ptt_str.length() > 0) {
+
+    if (!civDataValid) {
+      LOG1("CI-V data now fully valid – enabling POST");
+    }
+    civDataValid = true;
+  }
+}
+
 void sendCIVQuery(const uint8_t *commands, size_t length) {
   newData2 = false;
-  Serial2.write(startMarker);  // always twice 0xFE in the beginning
-  Serial2.write(startMarker);
-  Serial2.write(civ_addresses[params[3].toInt()]);
-  Serial2.write(TERM_address);
-  Serial2.write(commands, length);
-  Serial2.write(endMarker);
 
-  LOG2("CI-V query sent");
+  Serial2.write(0xFE);
+  Serial2.write(0xFE);
+
+  // to = Radio
+  Serial2.write(civRadioAddr);
+
+  // from = Controller (E0)
+  Serial2.write(TERM_address);
+
+  Serial2.write(commands, length);
+  Serial2.write(0xFD);
+
+  LOG2("CI-V query sent to radio 0x" + String(civRadioAddr, HEX));
 }
 
 void getpower() { sendCIVQuery(power_query, power_query_length); }
@@ -175,20 +236,53 @@ void getqrg()   { sendCIVQuery(qrg_query, qrg_query_length); }
 void getmode()  { sendCIVQuery(mode_query, mode_query_length); }
 void getptt()   { sendCIVQuery(ptt_query, ptt_query_length); LOG2("PTT query sent"); }
 
-void geticomdata() {
-  while (Serial2.available() > 0 && newData2 == false) {
-    byte currentByte = Serial2.read();
-    if (currentByte == startMarker) {
-      dataIndex = 0;
-    } else if (currentByte == endMarker) {
-      newData2 = true;
-    } else {
-      if (dataIndex < maxDataLength) {
-        receivedData[dataIndex] = currentByte;
-        dataIndex++;
-      }
-    }  
-  }
+bool geticomdata() {
+    static uint8_t state = 0;  // 0=idle, 1=first FE, 2=collecting
+    static uint16_t idx = 0;
+
+    while (Serial2.available() > 0) {
+        uint8_t b = Serial2.read();
+
+        switch (state) {
+
+        case 0: // idle
+            if (b == 0xFE) {
+                state = 1;
+            }
+            break;
+
+        case 1: // first FE seen
+            if (b == 0xFE) {
+                idx = 0;
+                receivedData[idx++] = 0xFE;
+                receivedData[idx++] = 0xFE;
+                state = 2;
+            } else {
+                state = 0;
+            }
+            break;
+
+        case 2: // collecting frame
+            if (idx >= maxDataLength) {
+                LOG1("CI-V RX overflow — frame dropped");
+                state = 0;
+                idx = 0;
+                break;
+            }
+
+            receivedData[idx++] = b;
+
+            if (b == 0xFD) {
+                dataIndex = idx;
+                state = 0;
+                idx = 0;
+                return true;
+            }
+            break;
+        }
+    }
+
+    return false;
 }
 
 // ---------------- utility ----------------
@@ -199,46 +293,78 @@ int bcd2Dec(int bcdValue) {
 }
 
 void logReceivedHex() {
-  // build hex string of receivedData up to dataIndex
-  String s = "CI-V RX: ";
-  for (int i = 0; i < dataIndex; ++i) {
-    if (receivedData[i] < 0x10) s += "0";
-    s += String(receivedData[i], HEX);
-    s += " ";
+  if (dataIndex > maxDataLength) {
+  LOG1("logReceivedHex: dataIndex overflow");
+  return;
+}
+
+  static char buf[3 * maxDataLength + 16]; // "FF " pro Byte + Prefix
+  int pos = 0;
+
+  pos += snprintf(buf + pos, sizeof(buf) - pos, "CI-V RX: ");
+
+  for (int i = 0; i < dataIndex && pos < (int)sizeof(buf) - 4; i++) {
+    pos += snprintf(buf + pos, sizeof(buf) - pos,
+                    "%02X ", receivedData[i]);
   }
-  LOG2(s);
+
+  LOG2(buf);
 }
 
 // ---------------- parsers ----------------
 void calculateQRG() {
-  uint8_t GHZ = 0, MHZ = 0, KHZ = 0, HZ = 0;
-  uint32_t t_QRG = 0;
-  GHZ = bcd2Dec(receivedData[7]);           // 1GHz & 100Mhz
-  MHZ = bcd2Dec(receivedData[6]);           // 10Mhz & 1Mhz
-  KHZ = bcd2Dec(receivedData[5]);           // 100Khz & 10KHz
-  HZ = bcd2Dec(receivedData[4]);            // 1Khz & 100Hz
-  t_QRG = ((GHZ * 1000000) + (MHZ * 10000) + (KHZ * 100) + (HZ * 1));
-  frequency = t_QRG*100;
+  if (dataIndex < 9) {
+    LOG2("calculateQRG: frame too short");
+    return;
+  }
+
+  uint32_t freq = 0;
+
+  freq += bcd2Dec(receivedData[5]);          // Hz + 10 Hz
+  freq += bcd2Dec(receivedData[6]) * 100;    // 100 Hz
+  freq += bcd2Dec(receivedData[7]) * 10000;  // 10 kHz
+  freq += bcd2Dec(receivedData[8]) * 1000000;// 1 MHz
+
+  // optional >100 MHz
+  if (dataIndex >= 10) {
+    freq += bcd2Dec(receivedData[9]) * 100000000;
+  }
+
+  frequency = freq;
+
   LOG2(String("calculateQRG -> ") + String(frequency));
 }
 
 void calculateMode() {
-  uint8_t mode_int = receivedData[3];
-  switch (mode_int) {
-    case 0: mode_str = "LSB"; break;
-    case 1: mode_str = "USB"; break;
-    case 2: mode_str = "AM"; break;
-    case 3: mode_str = "CW"; break;
-    case 4: mode_str = "RTTY"; break;
-    case 5: mode_str = "FM"; break;
-    case 6: mode_str = "FM"; break;
-    case 7: mode_str = "CW"; break;
-    case 8: mode_str = "RTTY"; break;
-    case 23: mode_str = "DSTAR"; break;
-    default: mode_str = "UNK"; break;
+
+  if (dataIndex < 7) {
+    LOG2("Mode frame too short – ignored");
+    return;
   }
-  LOG2(String("Mode parsed -> ") + mode_str);
+
+  uint8_t mode_int = receivedData[5];
+
+  switch (mode_int) {
+    case 0x00: mode_str = "LSB"; break;
+    case 0x01: mode_str = "USB"; break;
+    case 0x02: mode_str = "AM"; break;
+    case 0x03: mode_str = "CW"; break;
+    case 0x04: mode_str = "RTTY"; break;
+    case 0x05: mode_str = "FM"; break;
+    case 0x06: mode_str = "FM"; break;      // WFM / FM wide
+    case 0x07: mode_str = "CW"; break;      // CW-R
+    case 0x08: mode_str = "RTTY"; break;    // RTTY-R
+    case 0x17: mode_str = "DSTAR"; break;   // 0x17 == 23
+    default:
+      mode_str = "UNK";
+      LOG2("Unknown mode byte: 0x" + String(mode_int, HEX));
+      break;
+  }
+
+  LOG2("Mode parsed -> " + mode_str);
+  updateFromCIV();
 }
+
 
 void calculatePTT() {
   // Safe check: if dataIndex is small, log and return
@@ -247,7 +373,7 @@ void calculatePTT() {
     return;
   }
 
-  uint8_t ptt_int = receivedData[4];
+  uint8_t ptt_int = receivedData[6];
   switch (ptt_int) {
     case 0:
       if (ptt_str != "rx") {
@@ -270,43 +396,112 @@ void calculatePTT() {
     default:
       // unknown value: ignore
       break;
+    LOG2(String("PTT RAW=") + String(receivedData[5], HEX));
   }
 }
 
 void processReceivedData(void) {
-  // Debug hex dump
-  logReceivedHex();
 
-  if ((receivedData[0] == 0x00 || receivedData[0] == 0xE0)) { // broadcast to all (0x00), reply to terminal (0xE0)
-    switch(receivedData[2]) {
-      case 0x0: { // reply at broadcast - frequency?
-        calculateQRG();
+  static bool inRX = false;
+  if (inRX) return;
+  inRX = true;
+
+  do {
+    // -------------------------------------------------
+    // Basic sanity checks
+    // -------------------------------------------------
+    if (dataIndex > maxDataLength) {
+      LOG1("processReceivedData: dataIndex overflow");
+      break;
+    }
+
+    if (dataIndex < 6) break;
+
+    if (receivedData[0] != 0xFE || receivedData[1] != 0xFE) break;
+
+    byte toAddr   = receivedData[2];
+    byte fromAddr = receivedData[3];
+    byte cmd      = receivedData[4];
+
+    
+
+    const uint8_t CIV_CONTROLLER = 0xE0;
+    const uint8_t CIV_RADIO = civRadioAddr;
+
+    bool isRadioFrame = (fromAddr == CIV_RADIO);
+//      (fromAddr == CIV_RADIO) &&
+//      (toAddr == CIV_CONTROLLER || toAddr == 0x00);
+    // PTT frames are sometimes broadcast → allow them
+    if (cmd == 0x1C && fromAddr == CIV_RADIO) {
+      isRadioFrame = true;
+    }
+
+    if (!isRadioFrame) break;
+
+    // -------------------------------------------------
+    // Detect active CI-V device
+    // -------------------------------------------------
+    if (activeCivAddr != fromAddr) {
+      activeCivAddr = fromAddr;
+    }
+
+    // -------------------------------------------------
+    // Drop malformed MODE frames early
+    // -------------------------------------------------
+    if (cmd == 0x01 && dataIndex < 7) break;
+
+    // -------------------------------------------------
+    // Command decoding
+    // -------------------------------------------------
+    switch (cmd) {
+
+      case 0x00:
+      case 0x03:
+        if (dataIndex >= 10) {
+          calculateQRG();
+          civFreqUpdated = true;
+
+          if (frequency > 1000000UL) {
+            civDataValid = true;
+            time_last_update = millis();
+          }
+        }
         break;
-      }
-      case 0x1: { // mode broadcast
-        calculateMode();
+
+      case 0x01:
+        if (dataIndex >= 6) {
+          calculateMode();
+          civModeUpdated = true;
+        }
         break;
-      }
-      case 0x1C: { // reply to terminal on query
-        calculatePTT();
+
+      case 0x1C:
+        if (dataIndex >= 6) {
+          calculatePTT();
+          civPTTUpdated = true;
+          civDataValid = true;
+          time_last_update = millis();
+        }
         break;
-      }
-      case 0x3: { // qrg reply to terminal on query
-        calculateQRG();
+
+      case 0x14:
+        if (dataIndex >= 9) {
+          uint8_t hi = receivedData[6];
+          uint8_t lo = receivedData[7];
+
+          power = ((hi) * 100 + bcd2Dec(lo)) / 2.55;
+
+          civPowerUpdated = true;
+        }
         break;
-      }
-      case 0x14: {
-        power = ((receivedData[4]) * 100 + bcd2Dec(receivedData[5])) / 2.55;
-        LOG2(String("Power parsed -> ") + String(power));
-        break;
-      }
+
       default:
-        LOG2(String("Unhandled CI-V cmd: 0x") + String(receivedData[2], HEX));
         break;
     }
-  } else {
-    LOG2("Frame not for us");
-  }
+
+  } while (false);
+
+  inRX = false;
 }
 
 // ---------------- Display update ----------------
@@ -319,55 +514,49 @@ void updateDisplay() {
 
   // RX/TX dot top-right
   if (ptt_state) {
-    display.fillCircle(120, 6, 4, SSD1306_WHITE);  // TX = filled (red simulated)
+    display.fillCircle(120, 6, 4, SSD1306_WHITE);
   } else {
-    display.drawCircle(120, 6, 4, SSD1306_WHITE);  // RX = outline (green simulated)
+    display.drawCircle(120, 6, 4, SSD1306_WHITE);
   }
 
-  // Small RX/TX text
   display.setTextSize(1);
   display.setCursor(98, 0);
-  if (ptt_state) display.print("TX"); else display.print("RX");
+  display.print(ptt_state ? "TX" : "RX");
 
-  // QRG, Mode, Power
-  display.setTextSize(1);
-
-  float mhz = frequency / 1000000.0;
-  String qrgStr = String(mhz, 3) + " MHz";
-
+  // ---------- QRG ----------
   display.setCursor(0, 14);
   display.print("QRG: ");
-  display.print(qrgStr);
+  snprintf(qrgBuf, sizeof(qrgBuf), "%.3f MHz", frequency / 1000000.0);
+  display.print(qrgBuf);
 
+  // ---------- MODE ----------
   display.setCursor(0, 26);
   display.print("Mode: ");
-  display.print(mode_str);
+  display.print(mode_str.length() ? mode_str : "-");
 
+  // ---------- POWER ----------
   display.setCursor(0, 38);
   display.print("PWR: ");
-  display.print(String(power, 1));
-  display.print(" W");
+  snprintf(pwrBuf, sizeof(pwrBuf), "%.1f W", power);
+  display.print(pwrBuf);
 
+  // ---------- IP ----------
   display.setCursor(0, 54);
   display.print("IP: ");
-  display.print(WiFi.localIP().toString());
+  display.print(ipBuf);
 
   display.display();
 
-  // LED sync as backup
-  if (ptt_state) {
-    digitalWrite(LED_TX, HIGH);
-    digitalWrite(LED_RX, LOW);
-  } else {
-    digitalWrite(LED_TX, LOW);
-    digitalWrite(LED_RX, HIGH);
-  }
+  // LED sync
+  digitalWrite(LED_TX, ptt_state ? HIGH : LOW);
+  digitalWrite(LED_RX, ptt_state ? LOW  : HIGH);
 }
 
 // ---------------- JSON / HTTP / XMLRPC ----------------
 void create_json(unsigned long frequency, String mode, String ptt, float power) {  
   jsonDoc.clear();  
-  jsonDoc["radio"] = String(civ_options[params[3].toInt()][1]) + " Wavelog CI-V";
+  String radioName = civAddrToName(activeCivAddr);
+  jsonDoc["radio"] = radioName + " Wavelog CI-V";
   jsonDoc["frequency"] = frequency;
   jsonDoc["mode"] = mode;
   jsonDoc["ptt"] = ptt;
@@ -383,23 +572,38 @@ void create_json(unsigned long frequency, String mode, String ptt, float power) 
 }
 
 void post_json() {
+
+  if (!civDataValid) {
+    LOG1("CI-V data not valid yet, delaying POST...");
+    return;
+  }
+
   HTTPClient http;
-  http.begin(params[0] + params[1]); // Endpoint of REST-API on the Wavelog-webserver
+
+  String url = params[0] + params[1];
+  LOG2(String("POST to URL: ") + url);
+
+  http.begin(url);
   http.addHeader("Content-Type", "application/json");
-  Serial.println(buffer); // keep this raw print for compatibility (still visible only if Serial active)
+
+  LOG2(String("POST JSON: ") + String(buffer));
+
   int httpResponseCode = http.POST(buffer);
 
-  if (httpResponseCode > 0) {
-    LOG1(String("HTTP-state: ") + String(httpResponseCode));
+  if (httpResponseCode == 200) {
+    LOG2(String("HTTP-state: ") + String(httpResponseCode));
+
     String response = http.getString();
     LOG2(String("HTTP response: ") + response);
+
     old_mode_str = mode_str;
-    old_ptt_str = ptt_str;
     old_frequency = frequency;
     old_power = power;
+
   } else {
-    LOG1(String("Error on sending the post-request. HTTP-state: ") + String(httpResponseCode));
+    LOG1(String("POST failed. HTTP-state: ") + String(httpResponseCode));
   }
+
   http.end();
 }
 
@@ -435,23 +639,42 @@ void handleRoot() {
   html += "<input type='text' id='wavelogApiEndpoint' name='wavelogApiEndpoint' value='" + params[1] + "'><br>";
   html += "<label for='wavelogApiKey'>Wavelog API Key:</label><br>";
   html += "<input type='text' id='wavelogApiKey' name='wavelogApiKey' value='" + params[2] + "'><br>";
+  // --- TRX ADDRESS (HEX values, plus AUTO option) ---
+  html += "<div style='display:flex; align-items:center; gap:10px;'>";
+  html += "<div>";
   html += "<label for='TrxAddress'>Trx Address:</label><br>";
   html += "<select id='TrxAddress' name='TrxAddress'>";
 
-  for (int i = 0; i < sizeof(civ_options) / sizeof(civ_options[0]); ++i) {
-    String optionHTML = "<option value='" + String(civ_options[i][0]) + "'";
-    optionHTML += (params[3].toInt() == atoi(civ_options[i][0]) ? " selected" : "");
-    optionHTML += ">" + String(civ_options[i][1]) + "</option>";
-    html += optionHTML;
-  }
+  // Auto-Option
+  html += "<option value='AUTO'";
+  if (params[3] == "AUTO" || (params[3].length() == 0 && autodetectedCiv != ""))
+    html += " selected";
+  html += ">Autodetect";
+  if (autodetectedCiv != "")
+    html += " (found: " + autodetectedCiv + ")";
+  html += "</option>";
 
-  html += "</select><br>";
+  // fixed address
+  for (size_t i = 0; i < sizeof(civ_addresses) / sizeof(civ_addresses[0]); ++i) {
+    uint8_t a = civ_addresses[i];
+    char buf[3];
+    sprintf(buf, "%02X", a);
+    String hexStr = String(buf);
+    html += "<option value='" + hexStr + "'";
+    if (params[3].equalsIgnoreCase(hexStr)) html += " selected";
+    html += ">" + String(civ_options[i][1]) + " (" + hexStr + "h)</option>";
+  }
+  html += "</select>";
+  html += "<button type='button' onclick='autodetectCiv()'>Autodetect CI-V</button>";
+  html += "<button type='button' class='btn-display' onclick='toggleOled()'>OLED rotate 180°</button>";
   html += "<input type='submit' value='Save'>";
   html += "</form>";
+  html += "</div>";
+  html += "</div>";
+  html += "<br>";
   html += "<form action='/reboot' method='post'>";
   html += "<button type='submit' class='btn-reboot'>Reboot ESP32</button>";
   html += "</form>";
-
   // Debug-level selector
   html += "<h3>Debug Level</h3>";
   html += "<select id='debugLevelSelect'>";
@@ -488,14 +711,38 @@ void handleRoot() {
 
     function setDebugLevel() {
       var lvl = document.getElementById('debugLevelSelect').value;
-      fetch('/setDebug?level=' + lvl)
+      fetch('/setDebug?debuglevel=' + lvl)
         .then(r => r.json())
         .then(j => {
-          document.getElementById('debugSetResult').textContent = 'Set debug level to ' + j.level;
+          document.getElementById('debugSetResult').textContent = 'Set debug level to ' + j.debuglevel;
         })
         .catch(e => {
           document.getElementById('debugSetResult').textContent = 'Error setting debug level';
         });
+    }
+
+    function autodetectCiv() {
+      fetch('/autodetect', { method: 'POST' })
+        .then(r => r.json())
+        .then(j => {
+          alert('CI-V Adresse erkannt: ' + j.civ);
+          location.reload();
+        })
+        .catch(e => {
+          alert('Autodetect fehlgeschlagen');
+          console.error(e);
+        });
+    }
+
+    function toggleOled() {
+      fetch('/toggleOled', { method: 'POST' })
+        .then(r => r.json())
+        .then(j => {
+          console.log("OLED rotated:", j.rotated);
+          document.getElementById('oledBtn').textContent =
+            j.rotated ? 'OLED normal' : 'OLED 180°';
+        })
+        .catch(e => console.error(e));
     }
   )JS";
   html += "</script></body></html>";
@@ -503,12 +750,11 @@ void handleRoot() {
   server.send(200, "text/html", html);
 }
 
-void handleLogout() {
-  server.send(401);
-}
-
 // handle /trx used by root page
 void handleTrx() {
+  if (!server.authenticate(html_username, html_password)) {
+    return server.requestAuthentication();
+  }
   jsonDoc.clear();
   jsonDoc["qrg"] = frequency;
   jsonDoc["mode"] = mode_str;
@@ -516,6 +762,58 @@ void handleTrx() {
   jsonDoc["ptt"] = ptt_str;
   serializeJson(jsonDoc, buffer);
   server.send(200, "application/json", buffer);
+}
+
+void applyOledRotation() {
+  if (oledRotated) {
+    display.setRotation(2);   // 180°
+  } else {
+    display.setRotation(0);   // normal
+  }
+  display.clearDisplay();
+  display.display();
+}
+
+void handleToggleOled() {
+  oledRotated = !oledRotated;
+  params[5] = oledRotated ? "1" : "0";
+
+  saveParametersToSPIFFS();
+  applyOledRotation();
+
+  server.send(200, "application/json",
+    String("{\"rotated\":") + (oledRotated ? "true" : "false") + "}");
+}
+
+void handleAutoDetect() {
+  if (!server.authenticate(html_username, html_password)) {
+    return server.requestAuthentication();
+  }
+
+  LOG1("Starting CI-V autodetection...\n");
+
+  int detectedIndex = detectCivAddress();
+
+  if (detectedIndex >= 0) {
+    // get hex-string
+    String detectedHex = String(civ_addresses[detectedIndex], HEX);
+    detectedHex.toUpperCase();
+    if (detectedHex.length() < 2) detectedHex = "0" + detectedHex;
+
+    params[3] = detectedHex;
+
+    LOG1("Autodetected CI-V Address: " + detectedHex + "\n");
+  } else {
+    LOG1("No CI-V address detected!\n");
+  }
+
+  // return to root
+  server.sendHeader("Location", "/", true);
+  server.send(302, "text/plain", "");
+}
+
+void handleLogout() {
+  server.send(401);
 }
 
 void handleLoggedout() {
@@ -529,25 +827,23 @@ void handle_NotFound(){
 
 // Endpoint to set debug level and persist it
 void handleSetDebug() {
-  if (!server.authenticate(html_username, html_password)) {
-    return server.requestAuthentication();
-  }
+    if (!server.hasArg("debuglevel")) {
+        server.send(400, "application/json", "{\"error\":\"missing debuglevel\"}");
+        return;
+    }
 
-  if (!server.hasArg("level")) {
-    server.send(400, "application/json", "{\"error\":\"missing level\"}");
-    return;
-  }
+    int lvl = server.arg("debuglevel").toInt();
+    if (lvl < 0) lvl = 0;
+    if (lvl > 2) lvl = 2;
 
-  int lvl = server.arg("level").toInt();
-  if (lvl < 0) lvl = 0;
-  if (lvl > 2) lvl = 2;
+    params[4] = String(lvl);
+    saveParametersToSPIFFS();
 
-  debugLevel = lvl;
-  prefs.putInt("debugLevel", debugLevel); // persist
+    debugLevel = lvl;
 
-  String resp = "{\"level\": " + String(debugLevel) + "}";
-  LOG1(String("Debug level set to ") + String(debugLevel));
-  server.send(200, "application/json", resp);
+    server.send(200, "application/json",
+                "{\"debuglevel\":" + String(lvl) + "}");
+
 }
 
 // Debug page (plain log)
@@ -638,7 +934,82 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length
   }
 }
 
+int detectCivAddress() {
+  LOG1("Starting CI-V autodetect...\n");
+
+  const byte controller = 0xE0;   // ESP32 address
+  const byte cmd = 0x1C;          // Query used for probing
+
+  for (int i = 0; i < sizeof(civ_addresses); i++) {
+    byte addr = civ_addresses[i];
+
+    LOG2("Sent probe for 0x" + String(addr, HEX));
+
+    // --- SEND PROBE ---
+    Serial.write(0xFE);
+    Serial.write(0xFE);
+    Serial.write(addr);           // TO address (radio)
+    Serial.write(controller);     // FROM address (ESP32)
+    Serial.write(cmd);
+    Serial.write(0x00);
+    Serial.write(0xFD);
+
+    unsigned long timeout = millis() + 150;
+
+    int state = 0;
+    byte toAddr = 0;
+    byte fromAddr = 0;
+
+    while (millis() < timeout) {
+      if (Serial.available()) {
+
+        byte b = Serial.read();
+        LOG2("read byte: 0x" + String(b, HEX));
+
+        switch (state) {
+
+          case 0:   // wait for first FE
+            if (b == 0xFE) state = 1;
+            break;
+
+          case 1:   // wait for second FE
+            if (b == 0xFE) state = 2;
+            else state = 0;
+            break;
+
+          case 2:   // TO-Address
+            toAddr = b;
+            state = 3;
+            break;
+
+          case 3:   // FROM-Address
+            fromAddr = b;
+
+            // Response must be addressed TO controller (E0)
+            if (toAddr != controller) {
+              state = 0;
+              break;
+            }
+
+            // And must be FROM the probed address
+            if (fromAddr == addr) {
+              LOG1("Auto-detected CI-V address: 0x" + String(addr, HEX) + "\n");
+              return i;   // *** RETURN INDEX ***
+            }
+
+            state = 0;
+            break;
+        }
+      }
+    }
+  }
+
+  LOG1("Auto-detect failed, no known CI-V address responded.\n");
+  return -1;
+}
+
 // ---------------- SPIFFS params IO ----------------
+
 void loadParametersFromSPIFFS() {
   for (int i = 0; i < numParams; ++i) {
     File file = SPIFFS.open("/param" + String(i) + ".txt", "r");
@@ -668,13 +1039,31 @@ void handleSave() {
     return server.requestAuthentication();
   }
 
+  // Basiskonfiguration
   params[0] = server.arg("wavelogUrl");
   params[1] = server.arg("wavelogApiEndpoint");
   params[2] = server.arg("wavelogApiKey");
-  params[3] = server.arg("TrxAddress");
+
+  // -------------------------------
+  // TRX Address (HEX oder AUTO)
+  // -------------------------------
+  String trxSel = server.arg("TrxAddress");
+  trxSel.trim();
+  trxSel.toUpperCase();
+
+  if (trxSel == "AUTO") {
+    // Auto-Modus aktiv → "AUTO" speichern
+    params[3] = "AUTO";
+  } else {
+    // Feste HEX-Adresse z.B. "7C"
+    params[3] = trxSel;
+  }
+
+  // DebugLevel NICHT speichern – kommt per /setDebug!
 
   saveParametersToSPIFFS();
 
+  // Normales Redirect zurück auf /
   server.sendHeader("Location", "/", true);
   server.send(302, "text/plain", "");
 }
@@ -777,20 +1166,48 @@ void setup() {
   Serial2.begin(19200, SERIAL_8N1, 16, 17);  // ICOM CI-V
   delay(1000);
 
-  // Preferences init and load persisted debug level
-  prefs.begin("wlog", false);
-  debugLevel = prefs.getInt("debugLevel", DEFAULT_DEBUG_LEVEL);
-  LOG1(String("Loaded debug level: ") + String(debugLevel));
-
   LOG1("");
   LOG1("Booting Sketch...");
   MDNS.begin("esp32-ci-v");
-
+  
   if (!SPIFFS.begin(true)) {
     LOG1("SPIFFS initialization failed!");
     return;
   }
   
+  loadParametersFromSPIFFS();
+
+  delay(5);
+  loadDebugLevel();
+  delay(5);
+
+  if (params[3].length() == 0 || params[3] == "00") {
+    LOG1("No CI-V address stored. Starting auto-detection...");
+
+    detectCivAddress();
+
+    if (autodetectedCiv.length() == 2) {
+        params[3] = autodetectedCiv;
+        saveParametersToSPIFFS();
+        LOG1("Autodetected CI-V Address saved: " + autodetectedCiv);
+    } else {
+        LOG1("CI-V auto-detect failed. Keeping address unset.");
+    }
+  } else {
+    LOG1("CI-V address loaded from SPIFFS: " + params[3]);
+  }
+  // -------------------------------------------------
+  // Convert CI-V address string ("7C") to byte (0x7C)
+  // -------------------------------------------------
+  civRadioAddr = strtol(params[3].c_str(), nullptr, 16);
+
+  LOG1("CI-V address parsed as hex: 0x" + String(civRadioAddr, HEX));
+
+  if (params[5].length() == 0) {
+    params[5] = "0";
+    oledRotated = false;
+  }
+
   Wire.begin(21, 22);
 
   if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
@@ -805,6 +1222,8 @@ void setup() {
     display.display();
     delay(1500);
   }
+  oledRotated = (params[5] == "1");
+  applyOledRotation();
 
   pinMode(LED_RX, OUTPUT);
   pinMode(LED_TX, OUTPUT);
@@ -813,26 +1232,28 @@ void setup() {
   digitalWrite(LED_RX, HIGH);
   digitalWrite(LED_TX, LOW);
 
-  loadParametersFromSPIFFS();
-
   LOG1(String("URL: ") + params[0]);
   LOG1(String("Endpoint: ") + params[1]);
   LOG1(String("API-Key: ") + params[2]);
   LOG1(String("CI-V-Address: ") + params[3]);
   connectToWifi();
 
+  snprintf(ipBuf, sizeof(ipBuf), "%s", WiFi.localIP().toString().c_str());
+
   LOG1(String("IP-Address: ") + WiFi.localIP().toString());
 
   // --- Initial CI-V read at startup ---
-  delay(200);   // small delay to let CI-V settle
+  delay(400);   // small delay to let CI-V settle
   getmode();    // read mode immediately
   getpower();   // read power immediately
   getptt();     // get PTT state at startup
-  updateDisplay();  // immediate display refresh
+
   time_last_baseloop = millis();   // reset timer to avoid double polling
 
   server.on("/", HTTP_GET, handleRoot);
   server.on("/trx", HTTP_GET, handleTrx);
+  server.on("/toggleOled", HTTP_POST, handleToggleOled);
+  server.on("/autodetect", HTTP_POST, handleAutoDetect);
   server.on("/save", HTTP_POST, handleSave);
   server.on("/reboot", HTTP_POST, handleReboot);
   server.on("/logout", HTTP_GET, handleLogout, handleLoggedout);
@@ -866,32 +1287,20 @@ void setup() {
   time_last_baseloop = time_current_baseloop;
 
   if (params[0].length() > 0) {
+
     getmode();
-    if (params[3].toInt() >= 0) 
-      geticomdata();
-    if (newData2) {
-      processReceivedData();
-    }
-    newData2 = false;
-    delay(1000);
+    if (geticomdata()) processReceivedData();
+
     getqrg();
-    if (params[3].toInt() >= 0) 
-      geticomdata();
-    if (newData2) {
-      processReceivedData();
+    if (geticomdata()) processReceivedData();
+
+    if (civDataValid) {
+        create_json(frequency, mode_str, ptt_str, power);
+        post_json();
+    } else {
+        Serial.println("Skipping POST: No valid TRX data yet.");
     }
-    newData2 = false;
-    delay(1000);
-    getptt();
-    if (params[3].toInt() >= 0) 
-      geticomdata();
-    if (newData2) {
-      processReceivedData();
-    }
-    newData2 = false;
-    create_json(frequency, mode_str, ptt_str, power);
-    post_json();
-  }
+}
 }
 
 // ---------------- Loop ----------------
@@ -915,34 +1324,42 @@ void loop() {
       lastPTTQuery = millis();
     }
     
-    if (params[3].toInt() >= 0) 
-      geticomdata();
-    if (newData2) {
-      time_last_update = millis();
+    if (geticomdata()) {
       processReceivedData();
-      newData2 = false;
-
-      // update display immediately after new CI-V data processed
-      updateDisplay();
     }
+
+    if (civFreqUpdated || civModeUpdated || civPowerUpdated || civPTTUpdated) {
+      updateFromCIV();
+      civFreqUpdated  = false;
+      civModeUpdated  = false;
+      civPowerUpdated = false;
+      civPTTUpdated   = false;
+    }
+
     // Debug-Output every second
     if (millis() - lastDebug > 1000) {
-      LOG2(String("[DBG] QRG: ") + String(frequency) + " | MODE: " + mode_str + " | PTT: " + ptt_str + " | PWR: " + String(power));
+      LOG2(String("[DBG] QRG: ") + String(frequency) + " | MODE: " + mode_str + " | PWR: " + String(power) + " | PTT: " + ptt_str);
       lastDebug = millis();
+    }
+
+//    delay(10);
+    if (civDataValid &&
+        frequency > 0 &&
+        mode_str.length() > 0 &&
+        ptt_str.length() > 0 &&
+        (millis() - time_last_update) > DEBOUNCE_TIME) {
+
+    create_json(frequency, mode_str, ptt_str, power);
+    post_json();
     }
 
     // periodic display refresh (if no new CI-V frames)
     updateDisplay();
-
-    if (( mode_str != old_mode_str || frequency != old_frequency || ptt_str != old_ptt_str || power != old_power) && ((time_current_baseloop-time_last_update)>DEBOUNCE_TIME)) {
-      // send json to server
-      create_json(frequency, mode_str, ptt_str, power);
-      post_json();
-    }
   } else {
     LOG1("No connection to your WiFi-network.");
     connectToWifi();
   }
   // allow other tasks without blocking WS
-  vTaskDelay(1);
+//  vTaskDelay(1);
+//  delay(5);
 } // end loop
