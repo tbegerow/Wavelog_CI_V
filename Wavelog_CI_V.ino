@@ -16,10 +16,8 @@
 
 // --------------------- CONFIG / DEBUG ---------------------
 #define DEBUG_WS 1                     // WebSocket debug broadcast enabled (1 = allow broadcast when level >=1)
-#define DEFAULT_DEBUG_LEVEL 1          // 0=off, 1=normal, 2=Debug++
+#define DEFAULT_DEBUG_LEVEL 1          // 0=off, 1=normal, 2=Debug+ (1 sec. Loop), 3=Debug++ (+JSON), 4=Debug++ (+XML-RPC), 5=Debug++ (+PTTquery)
 int debugLevel = DEFAULT_DEBUG_LEVEL;
-//int debugLevel = params.debuglevel;
-
 #define MAX_LOG_LINES 500
 String debugLog[MAX_LOG_LINES];
 int debugIndex = 0;
@@ -27,62 +25,12 @@ int debugIndex = 0;
 // WebSocket
 WebSocketsServer webSocket = WebSocketsServer(81); // WebSocket-Server on Port 81
 
-// --------------------- Debug functions ---------------------
-void loadDebugLevel() {
-    if (SPIFFS.exists("/debuglevel.txt")) {
-        File f = SPIFFS.open("/debuglevel.txt", "r");
-        if (f) {
-            debugLevel = f.readString().toInt();
-            f.close();
-        }
-    }
-    if (debugLevel < 0 || debugLevel > 2) debugLevel = 1;
-    Serial.printf("Loaded debug level: %d\n", debugLevel);
-}
-
-void saveDebugLevel() {
-    File f = SPIFFS.open("/debuglevel.txt", "w");
-    if (f) {
-        f.print(debugLevel);
-        f.close();
-    }
-}
-
-void addDebugRaw(const String &msg) {
-  debugLog[debugIndex] = msg;
-  debugIndex = (debugIndex + 1) % MAX_LOG_LINES;
-}
-
-void broadcastDebug(const String &s) {
-  // broadcastTXT(String&) → mutable Kopie
-  String tmp = s;
-  webSocket.broadcastTXT(tmp);
-}
-
-void addDebugPrint(const String &msg) {
-  // Immer ins RAM-Log schreiben
-  addDebugRaw(msg);
-
-  // Serial nur wenn >= 1
-  if (debugLevel >= 1) {
-    Serial.println(msg);
-  }
-
-  // WebSocket nur wenn erlaubt & level >= 1
-  if (DEBUG_WS && debugLevel >= 1) {
-    broadcastDebug(msg);
-  }
-}
-
-#define LOG1(msg) if (debugLevel >= 1) addDebugPrint(msg)
-#define LOG2(msg) if (debugLevel >= 2) addDebugPrint(msg)
-// --------------------- end Debug ------------------------
-
 // ---------------- Web / params / servers ------------------
 const char* html_username = "sysop";  // Webif username
 const char* html_password = "admin";  // Webif password
 const int numParams = 6; // number of  parameters
 String params[numParams] = {"", "", "", "", "", ""}; // initialization of parameters
+
 WebServer server(80);
 WebServer XMLRPCserver(12345);
 
@@ -92,6 +40,7 @@ unsigned long time_last_baseloop;
 unsigned long time_last_update;
 #define BASELOOP_TICK 5000 // = 5 seconds
 #define DEBOUNCE_TIME 1500 // = 1,5sec. process ONLY if TRX has settled
+unsigned long lastPostTime = 0;
 
 // define 0.96" SDD1306 display
 #define SCREEN_WIDTH 128
@@ -108,8 +57,11 @@ bool oledRotated = false;
 #define LED_TX 26
 #define LED_RX 27
 
+#define CIV_COUNT (sizeof(civ_addresses) / sizeof(civ_addresses[0]))
 uint8_t activeCivAddr = 0x00;
 uint8_t civRadioAddr;
+uint8_t lastCivAddr = 0;
+String radioName = "detecting...";
 
 unsigned long frequency = 0;
 float power = 0.0;
@@ -122,9 +74,11 @@ float old_power = 0.0;
 String old_mode_str = "";
 String old_ptt_str = "";
 
+// ----- state -> create/post json -----
 volatile bool civFreqUpdated  = false;
 volatile bool civModeUpdated  = false;
 volatile bool civPowerUpdated = false;
+// ----- event -> display / XML-RPC
 volatile bool civPTTUpdated   = false;
 
 // Realtime-PTT Query
@@ -177,14 +131,90 @@ size_t power_query_length = sizeof(power_query) / sizeof(power_query[0]);
 String buffer;
 DynamicJsonDocument jsonDoc(512);
 
+String civCommandToHex(const uint8_t *cmd, size_t len) {
+  String s;
+  for (size_t i = 0; i < len; i++) {
+    if (cmd[i] < 0x10) s += "0";
+    s += String(cmd[i], HEX);
+    if (i < len - 1) s += " ";
+  }
+  s.toUpperCase();
+  return s;
+}
+
+String civCmdName(uint8_t cmd) {
+  switch (cmd) {
+    case 0x00: return "FREQ(bc)";
+    case 0x03: return "FREQ";
+    case 0x01: return "MODE";
+    case 0x14: return "POWER";
+    case 0x1C: return "PTT";
+    default:
+      return "CMD 0x" + String(cmd, HEX);
+  }
+}
+
 String civAddrToName(uint8_t addr) {
-  for (int i = 0; civ_options[i][0] != nullptr; i++) {
-    if (strtol(civ_options[i][0], nullptr, 16) == addr) {
+  for (size_t i = 0; i < CIV_COUNT; i++) {
+    if (civ_addresses[i] == addr) {
       return String(civ_options[i][1]);
     }
   }
-  return String("Unknown CI-V (0x") + String(addr, HEX) + ")";
+  return String("unknown");
 }
+
+// --------------------- Debug functions ---------------------
+#define LOG1(msg) if (debugLevel >= 1) addDebugPrint(msg)
+#define LOG2(msg) if (debugLevel >= 2) addDebugPrint(msg)
+#define LOG3(msg) if (debugLevel >= 3) addDebugPrint(msg)
+#define LOG4(msg) if (debugLevel >= 4) addDebugPrint(msg)
+#define LOG5(msg) if (debugLevel >= 5) addDebugPrint(msg)
+
+void loadDebugLevel() {
+    if (params[4].length() == 0) {
+        // Default
+        debugLevel = 1;
+        params[4] = "1";
+    } else {
+        debugLevel = params[4].toInt();
+    }
+
+    if (debugLevel < 0 || debugLevel > 5) {
+        debugLevel = 1;
+        params[4] = "1";
+    }
+
+    LOG1(String("Loaded debug level: ") + debugLevel);
+//    Serial.printf("Loaded debug level: %d\n", debugLevel);
+}
+
+void addDebugRaw(const String &msg) {
+  debugLog[debugIndex] = msg;
+  debugIndex = (debugIndex + 1) % MAX_LOG_LINES;
+}
+
+void broadcastDebug(const String &s) {
+  // broadcastTXT(String&) → mutable Kopie
+  String tmp = s;
+  webSocket.broadcastTXT(tmp);
+}
+
+void addDebugPrint(const String &msg) {
+  // Immer ins RAM-Log schreiben
+  addDebugRaw(msg);
+
+  // Serial nur wenn >= 1
+  if (debugLevel >= 1) {
+    Serial.println(msg);
+  }
+
+  // WebSocket nur wenn erlaubt & level >= 1
+  if (DEBUG_WS && debugLevel >= 1) {
+    broadcastDebug(msg);
+  }
+}
+
+// --------------------- end Debug ------------------------
 
 // ---------------- WiFi connect ----------------
 void connectToWifi() {
@@ -202,18 +232,55 @@ void connectToWifi() {
 // ---------------- CI-V send / receive ----------------
 bool civDataValid = false;
 void updateFromCIV() {
-  if (frequency > 0 &&
-      mode_str.length() > 0 &&
-      ptt_str.length() > 0) {
 
-    if (!civDataValid) {
-      LOG1("CI-V data now fully valid – enabling POST");
+  static unsigned long lastPttLog = 0;
+
+  // -------- PTT only → LOG5 (rate limited) --------
+  if (civPTTUpdated) {
+
+    if (debugLevel >= 5 && millis() - lastPttLog > 1000) {
+      LOG5("[CI-V] PTT update: " + ptt_str);
+      lastPttLog = millis();
     }
-    civDataValid = true;
   }
+
+  // -------- Normal CI-V updates → LOG3 --------
+  if (civFreqUpdated || civModeUpdated || civPowerUpdated) {
+    LOG3("[CI-V] freq=" + String(frequency) +
+         " mode=" + mode_str +
+         " power=" + String(power));
+  }
+
+  // ---------- First-time validity ----------
+  static bool freqSeen = false;
+  static bool modeSeen = false;
+
+  if (civFreqUpdated) freqSeen = true;
+  if (civModeUpdated) modeSeen = true;
+
+  if (!civDataValid && freqSeen && modeSeen) {
+    civDataValid = true;
+    LOG1("CI-V data now fully valid – enabling POST");
+  }
+
+  // --------- radioName initializing ----------
+  static bool radioNameInitialized = false;
+  if (!radioNameInitialized && activeCivAddr != 0) {
+    LOG1("activeCivAddr now = 0x" + String(activeCivAddr, HEX));
+
+    updateRadioName();
+    radioNameInitialized = true;
+  }
+
+  civFreqUpdated  = false;
+  civModeUpdated  = false;
+  civPowerUpdated = false;
+  civPTTUpdated   = false;
 }
 
 void sendCIVQuery(const uint8_t *commands, size_t length) {
+
+  bool isPTT = (commands[0] == 0x1C); // && commands[1] == 0x00 );
   newData2 = false;
 
   Serial2.write(0xFE);
@@ -228,13 +295,22 @@ void sendCIVQuery(const uint8_t *commands, size_t length) {
   Serial2.write(commands, length);
   Serial2.write(0xFD);
 
-  LOG2("CI-V query sent to radio 0x" + String(civRadioAddr, HEX));
+  if (isPTT) {
+    LOG5("CI-V PTT query sent");
+  } else {
+    LOG3(
+      "CI-V query sent to radio 0x" +
+      String(civRadioAddr, HEX) +
+      " CMD: " +
+      civCommandToHex(commands, length)
+    );
+  }
 }
 
 void getpower() { sendCIVQuery(power_query, power_query_length); }
 void getqrg()   { sendCIVQuery(qrg_query, qrg_query_length); }
 void getmode()  { sendCIVQuery(mode_query, mode_query_length); }
-void getptt()   { sendCIVQuery(ptt_query, ptt_query_length); LOG2("PTT query sent"); }
+void getptt()   { sendCIVQuery(ptt_query, ptt_query_length); LOG5("PTT query sent"); }
 
 bool geticomdata() {
     static uint8_t state = 0;  // 0=idle, 1=first FE, 2=collecting
@@ -309,6 +385,25 @@ void logReceivedHex() {
   }
 
   LOG2(buf);
+}
+
+void updateRadioName() {
+  if (activeCivAddr == 0) {
+    radioName = "detecting...";
+    return;
+  }
+
+  if (activeCivAddr == lastCivAddr) return;
+
+  lastCivAddr = activeCivAddr;
+  radioName = civAddrToName(activeCivAddr);
+
+  if (radioName.length() == 0) {
+    radioName = "unknown";
+  }
+
+  LOG1("Active TRX → " + radioName +
+       " (0x" + String(activeCivAddr, HEX) + ")");
 }
 
 // ---------------- parsers ----------------
@@ -400,6 +495,16 @@ void calculatePTT() {
   }
 }
 
+void dumpCivRawFrame(uint8_t len, uint8_t cmd) {
+  String s = "[CI-V RX " + civCmdName(cmd) + "] ";
+  for (uint8_t i = 0; i < len; i++) {
+    if (receivedData[i] < 0x10) s += "0";
+    s += String(receivedData[i], HEX);
+    s += " ";
+  }
+  LOG3(s);
+}
+
 void processReceivedData(void) {
 
   static bool inRX = false;
@@ -428,9 +533,9 @@ void processReceivedData(void) {
     const uint8_t CIV_CONTROLLER = 0xE0;
     const uint8_t CIV_RADIO = civRadioAddr;
 
-    bool isRadioFrame = (fromAddr == CIV_RADIO);
-//      (fromAddr == CIV_RADIO) &&
-//      (toAddr == CIV_CONTROLLER || toAddr == 0x00);
+    bool isRadioFrame = //(fromAddr == CIV_RADIO);
+      (fromAddr == CIV_RADIO) &&
+      (toAddr == CIV_CONTROLLER || toAddr == 0x00);
     // PTT frames are sometimes broadcast → allow them
     if (cmd == 0x1C && fromAddr == CIV_RADIO) {
       isRadioFrame = true;
@@ -438,6 +543,10 @@ void processReceivedData(void) {
 
     if (!isRadioFrame) break;
 
+    // ---- RAW CI-V frame dump (debug only) ----
+    if (cmd != 0x1C || debugLevel >= 5) {
+      dumpCivRawFrame(dataIndex, cmd);
+    }
     // -------------------------------------------------
     // Detect active CI-V device
     // -------------------------------------------------
@@ -523,10 +632,14 @@ void updateDisplay() {
   display.setCursor(98, 0);
   display.print(ptt_state ? "TX" : "RX");
 
+  // ---------- TRX ----------
+  display.setCursor(0, 0);
+  display.print(radioName);
+
   // ---------- QRG ----------
   display.setCursor(0, 14);
   display.print("QRG: ");
-  snprintf(qrgBuf, sizeof(qrgBuf), "%.3f MHz", frequency / 1000000.0);
+  snprintf(qrgBuf, sizeof(qrgBuf), "%.4f MHz", frequency / 1000000.0);
   display.print(qrgBuf);
 
   // ---------- MODE ----------
@@ -555,7 +668,6 @@ void updateDisplay() {
 // ---------------- JSON / HTTP / XMLRPC ----------------
 void create_json(unsigned long frequency, String mode, String ptt, float power) {  
   jsonDoc.clear();  
-  String radioName = civAddrToName(activeCivAddr);
   jsonDoc["radio"] = radioName + " Wavelog CI-V";
   jsonDoc["frequency"] = frequency;
   jsonDoc["mode"] = mode;
@@ -568,7 +680,7 @@ void create_json(unsigned long frequency, String mode, String ptt, float power) 
   jsonDoc["uplink_mode"] = 0;
   jsonDoc["key"] = params[2];
   serializeJson(jsonDoc, buffer);
-  LOG2(String("create_json -> ") + buffer);
+  LOG3(String("create_json -> ") + buffer);
 }
 
 void post_json() {
@@ -581,20 +693,20 @@ void post_json() {
   HTTPClient http;
 
   String url = params[0] + params[1];
-  LOG2(String("POST to URL: ") + url);
+  LOG3(String("POST to URL: ") + url);
 
   http.begin(url);
   http.addHeader("Content-Type", "application/json");
 
-  LOG2(String("POST JSON: ") + String(buffer));
+  LOG3(String("POST JSON: ") + String(buffer));
 
   int httpResponseCode = http.POST(buffer);
 
   if (httpResponseCode == 200) {
-    LOG2(String("HTTP-state: ") + String(httpResponseCode));
+    LOG3(String("HTTP-state: ") + String(httpResponseCode));
 
     String response = http.getString();
-    LOG2(String("HTTP response: ") + response);
+    LOG3(String("HTTP response: ") + response);
 
     old_mode_str = mode_str;
     old_frequency = frequency;
@@ -680,7 +792,10 @@ void handleRoot() {
   html += "<select id='debugLevelSelect'>";
   html += "<option value='0'" + String((debugLevel==0) ? " selected" : "") + ">0 = OFF</option>";
   html += "<option value='1'" + String((debugLevel==1) ? " selected" : "") + ">1 = NORMAL</option>";
-  html += "<option value='2'" + String((debugLevel==2) ? " selected" : "") + ">2 = DEBUG++</option>";
+  html += "<option value='2'" + String((debugLevel==2) ? " selected" : "") + ">2 = DEBUG+ (1s Loop)</option>";
+  html += "<option value='3'" + String((debugLevel==3) ? " selected" : "") + ">3 = DEBUG++ (+CI-V/JSON)</option>";
+  html += "<option value='4'" + String((debugLevel==4) ? " selected" : "") + ">4 = DEBUG++ (+XML-RPC)</option>";
+  html += "<option value='5'" + String((debugLevel==5) ? " selected" : "") + ">5 = DEBUG++ (+PTT-query)</option>";
   html += "</select>";
   html += "<button onclick='setDebugLevel()'>Set</button>";
   html += "<p id='debugSetResult'></p>";
@@ -723,13 +838,18 @@ void handleRoot() {
 
     function autodetectCiv() {
       fetch('/autodetect', { method: 'POST' })
-        .then(r => r.json())
-        .then(j => {
-          alert('CI-V Adresse erkannt: ' + j.civ);
-          location.reload();
+        .then(r => r.json())           
+        .then(j => {                   
+          console.log(j);
+          if (j.status === "ok") {
+            alert('CI-V Address detected: ' + j.civAddr);
+            location.reload();
+          } else {
+            alert('Autodetect failure');
+          }
         })
         .catch(e => {
-          alert('Autodetect fehlgeschlagen');
+          alert('Autodetect failure');
           console.error(e);
         });
     }
@@ -786,30 +906,36 @@ void handleToggleOled() {
 }
 
 void handleAutoDetect() {
+
   if (!server.authenticate(html_username, html_password)) {
     return server.requestAuthentication();
   }
 
-  LOG1("Starting CI-V autodetection...\n");
+  LOG1("Starting CI-V autodetection...");
 
   int detectedIndex = detectCivAddress();
 
   if (detectedIndex >= 0) {
-    // get hex-string
+
     String detectedHex = String(civ_addresses[detectedIndex], HEX);
     detectedHex.toUpperCase();
-    if (detectedHex.length() < 2) detectedHex = "0" + detectedHex;
+    if (detectedHex.length() < 2)
+      detectedHex = "0" + detectedHex;
 
     params[3] = detectedHex;
+    civRadioAddr = civ_addresses[detectedIndex];
+    saveParametersToSPIFFS();
 
-    LOG1("Autodetected CI-V Address: " + detectedHex + "\n");
+    LOG1("Autodetected CI-V Address saved: " + detectedHex);
+
+    server.send(200, "application/json",
+                "{\"status\":\"ok\",\"civAddr\":\"" + detectedHex + "\"}");
   } else {
-    LOG1("No CI-V address detected!\n");
-  }
 
-  // return to root
-  server.sendHeader("Location", "/", true);
-  server.send(302, "text/plain", "");
+    LOG1("No CI-V address detected!");
+    server.send(200, "application/json",
+                "{\"status\":\"fail\"}");
+  }
 }
 
 void handleLogout() {
@@ -834,9 +960,9 @@ void handleSetDebug() {
 
     int lvl = server.arg("debuglevel").toInt();
     if (lvl < 0) lvl = 0;
-    if (lvl > 2) lvl = 2;
-
+    if (lvl > 5) lvl = 5;
     params[4] = String(lvl);
+    
     saveParametersToSPIFFS();
 
     debugLevel = lvl;
@@ -876,29 +1002,29 @@ void handleDebugWSPage() {
   html += "<div id='controls'><button onclick='sendCmd(\"last\")'>Send last</button> <button onclick='sendCmd(\"clear\")'>Clear server log</button></div>";
   html += "<div id='log'></div>";
   html += R"JS(
-<script>
-let host = location.hostname;
-let ws = new WebSocket('ws://' + host + ':81/');
-let log = document.getElementById('log');
-ws.onopen = function() {
-  log.appendChild(document.createTextNode('[WS] connected\n'));
-  ws.send('last'); // ask for last logs on connect
-};
-ws.onmessage = function(evt) {
-  let line = evt.data;
-  let node = document.createElement('div');
-  node.textContent = line;
-  log.appendChild(node);
-  log.scrollTop = log.scrollHeight;
-};
-ws.onclose = function() {
-  log.appendChild(document.createTextNode('[WS] disconnected\n'));
-};
-function sendCmd(cmd) {
-  if (ws.readyState === WebSocket.OPEN) ws.send(cmd);
-}
-</script>
-)JS";
+    <script>
+    let host = location.hostname;
+    let ws = new WebSocket('ws://' + host + ':81/');
+    let log = document.getElementById('log');
+    ws.onopen = function() {
+      log.appendChild(document.createTextNode('[WS] connected\n'));
+      ws.send('last'); // ask for last logs on connect
+    };
+    ws.onmessage = function(evt) {
+      let line = evt.data;
+      let node = document.createElement('div');
+      node.textContent = line;
+      log.appendChild(node);
+      log.scrollTop = log.scrollHeight;
+      };
+    ws.onclose = function() {
+      log.appendChild(document.createTextNode('[WS] disconnected\n'));
+    };
+    function sendCmd(cmd) {
+    if (ws.readyState === WebSocket.OPEN) ws.send(cmd);
+    }
+    </script>
+  )JS";
   html += "</body></html>";
   server.send(200, "text/html", html);
 }
@@ -935,78 +1061,83 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length
 }
 
 int detectCivAddress() {
-  LOG1("Starting CI-V autodetect...\n");
 
-  const byte controller = 0xE0;   // ESP32 address
-  const byte cmd = 0x1C;          // Query used for probing
+  LOG1("Starting CI-V autodetect...");
+
+  const byte controller = 0xE0;   // ESP32 CI-V address
+  const byte cmd = 0x03;          // Read frequency
 
   for (int i = 0; i < sizeof(civ_addresses); i++) {
-    byte addr = civ_addresses[i];
 
-    LOG2("Sent probe for 0x" + String(addr, HEX));
+    byte addr = civ_addresses[i];
+    LOG2("Probing CI-V address 0x" + String(addr, HEX));
 
     // --- SEND PROBE ---
-    Serial.write(0xFE);
-    Serial.write(0xFE);
-    Serial.write(addr);           // TO address (radio)
-    Serial.write(controller);     // FROM address (ESP32)
-    Serial.write(cmd);
-    Serial.write(0x00);
-    Serial.write(0xFD);
+    Serial2.write(0xFE);
+    Serial2.write(0xFE);
+    Serial2.write(addr);        // TO radio
+    Serial2.write(controller);  // FROM ESP
+    Serial2.write(cmd);
+    Serial2.write(0xFD);
 
-    unsigned long timeout = millis() + 150;
+    unsigned long timeout = millis() + 200;
 
     int state = 0;
     byte toAddr = 0;
     byte fromAddr = 0;
+    byte rxCmd = 0;
 
     while (millis() < timeout) {
-      if (Serial.available()) {
 
-        byte b = Serial.read();
-        LOG2("read byte: 0x" + String(b, HEX));
+      if (!Serial2.available()) continue;
+      byte b = Serial2.read();
 
-        switch (state) {
+      switch (state) {
 
-          case 0:   // wait for first FE
-            if (b == 0xFE) state = 1;
-            break;
+        case 0:  // FE
+          if (b == 0xFE) state = 1;
+          break;
 
-          case 1:   // wait for second FE
-            if (b == 0xFE) state = 2;
-            else state = 0;
-            break;
+        case 1:  // FE
+          if (b == 0xFE) state = 2;
+          else state = 0;
+          break;
 
-          case 2:   // TO-Address
-            toAddr = b;
-            state = 3;
-            break;
+        case 2:  // TO
+          toAddr = b;
+          state = 3;
+          break;
 
-          case 3:   // FROM-Address
-            fromAddr = b;
+        case 3:  // FROM
+          fromAddr = b;
+          state = 4;
+          break;
 
-            // Response must be addressed TO controller (E0)
-            if (toAddr != controller) {
-              state = 0;
-              break;
+        case 4:  // CMD
+          rxCmd = b;
+          state = 5;
+          break;
+
+        case 5:  // wait for FD
+          if (b == 0xFD) {
+            if (toAddr == controller &&
+                fromAddr == addr &&
+                rxCmd == cmd) {
+
+              LOG1("Auto-detected CI-V address: 0x" + String(addr, HEX));
+              return i;
             }
-
-            // And must be FROM the probed address
-            if (fromAddr == addr) {
-              LOG1("Auto-detected CI-V address: 0x" + String(addr, HEX) + "\n");
-              return i;   // *** RETURN INDEX ***
-            }
-
             state = 0;
-            break;
-        }
+          }
+          break;
       }
     }
   }
 
-  LOG1("Auto-detect failed, no known CI-V address responded.\n");
+  LOG1("Auto-detect failed: no CI-V device responded");
   return -1;
 }
+
 
 // ---------------- SPIFFS params IO ----------------
 
@@ -1040,30 +1171,26 @@ void handleSave() {
   }
 
   // Basiskonfiguration
+  // -------------------------------
   params[0] = server.arg("wavelogUrl");
   params[1] = server.arg("wavelogApiEndpoint");
   params[2] = server.arg("wavelogApiKey");
 
-  // -------------------------------
   // TRX Address (HEX oder AUTO)
   // -------------------------------
   String trxSel = server.arg("TrxAddress");
   trxSel.trim();
   trxSel.toUpperCase();
-
   if (trxSel == "AUTO") {
-    // Auto-Modus aktiv → "AUTO" speichern
+  // Auto-Modus active → save "AUTO"
     params[3] = "AUTO";
   } else {
-    // Feste HEX-Adresse z.B. "7C"
+  // fix HEX-address exp. "7C"
     params[3] = trxSel;
-  }
-
-  // DebugLevel NICHT speichern – kommt per /setDebug!
+  } 
 
   saveParametersToSPIFFS();
 
-  // Normales Redirect zurück auf /
   server.sendHeader("Location", "/", true);
   server.send(302, "text/plain", "");
 }
@@ -1087,19 +1214,19 @@ String rig_get_ptt() {
 // ---------------- XML-RPC handling ----------------
 void handleRPC() {
   // DEBUG Trace
-  LOG2("=== Incoming RPC Request ===");
-  LOG2(String("Client: ") + XMLRPCserver.client().remoteIP().toString());
+  LOG4("=== Incoming RPC Request ===");
+  LOG4(String("Client: ") + XMLRPCserver.client().remoteIP().toString());
   
-  // HTTP Header-Daten
+  // HTTP Header
   for (int i = 0; i < XMLRPCserver.args(); i++) {
-    LOG2(String("Arg ") + i + ": " + XMLRPCserver.argName(i));
-    LOG2(String("Value: ") + XMLRPCserver.arg(i));
+    LOG4(String("Arg ") + i + ": " + XMLRPCserver.argName(i));
+    LOG4(String("Value: ") + XMLRPCserver.arg(i));
   }
 
   String request = XMLRPCserver.arg(0);
-  LOG2("=== XML Request ===");
-  LOG2(request);
-  LOG2("===============================");
+  LOG4("=== XML Request ===");
+  LOG4(request);
+  LOG4("===============================");
 
   // processing XML-RPC-request
   // === rig.get_vfo ===
@@ -1115,7 +1242,7 @@ void handleRPC() {
         "</params>"
       "</methodResponse>";
     XMLRPCserver.send(200, "text/xml", xmlResponse);
-    LOG2(String("XMLRPC-Response (rig.get_vfo): ") + xmlResponse);
+    LOG4(String("XMLRPC-Response (rig.get_vfo): ") + xmlResponse);
   }
 
   // === rig.get_mode ===
@@ -1131,7 +1258,7 @@ void handleRPC() {
         "</params>"
       "</methodResponse>";
     XMLRPCserver.send(200, "text/xml", xmlResponse);
-    LOG2(String("XMLRPC-Response (rig.get_mode): ") + xmlResponse);
+    LOG4(String("XMLRPC-Response (rig.get_mode): ") + xmlResponse);
   }
 
   // === rig.get_ptt ===
@@ -1149,10 +1276,10 @@ void handleRPC() {
       "</methodResponse>";
     XMLRPCserver.send(200, "text/xml", xmlResponse);
 
-    LOG2("----- XML-RPC Response Sent -----");
-    LOG2(xmlResponse);
-    LOG2("----- END Response -----");
-  // === Unbekannte Methode ===
+    LOG4("----- XML-RPC Response Sent -----");
+    LOG4(xmlResponse);
+    LOG4("----- END Response -----");
+  // === unknown ===
   }  else {
     XMLRPCserver.send(400, "text/plain", "Unknown method");
     LOG1("XMLRPC: Unknown method requested");
@@ -1228,7 +1355,7 @@ void setup() {
   pinMode(LED_RX, OUTPUT);
   pinMode(LED_TX, OUTPUT);
 
-  // Initialstatus: RX = grün
+  // Initialstatus: RX = green
   digitalWrite(LED_RX, HIGH);
   digitalWrite(LED_TX, LOW);
 
@@ -1241,7 +1368,7 @@ void setup() {
   snprintf(ipBuf, sizeof(ipBuf), "%s", WiFi.localIP().toString().c_str());
 
   LOG1(String("IP-Address: ") + WiFi.localIP().toString());
-
+  
   // --- Initial CI-V read at startup ---
   delay(400);   // small delay to let CI-V settle
   getmode();    // read mode immediately
@@ -1286,21 +1413,13 @@ void setup() {
   time_current_baseloop = millis();
   time_last_baseloop = time_current_baseloop;
 
-  if (params[0].length() > 0) {
-
-    getmode();
-    if (geticomdata()) processReceivedData();
-
-    getqrg();
-    if (geticomdata()) processReceivedData();
-
-    if (civDataValid) {
-        create_json(frequency, mode_str, ptt_str, power);
-        post_json();
-    } else {
-        Serial.println("Skipping POST: No valid TRX data yet.");
-    }
-}
+  if (civDataValid) {
+    create_json(frequency, mode_str, ptt_str, power);
+    post_json();
+  } else {
+    Serial.println("Skipping POST: No valid TRX data yet.");
+  }
+//  }
 }
 
 // ---------------- Loop ----------------
@@ -1326,14 +1445,44 @@ void loop() {
     
     if (geticomdata()) {
       processReceivedData();
-    }
+      
+      bool civFrameChanged =
+        civFreqUpdated ||
+        civModeUpdated ||
+        civPowerUpdated;
 
-    if (civFreqUpdated || civModeUpdated || civPowerUpdated || civPTTUpdated) {
-      updateFromCIV();
-      civFreqUpdated  = false;
-      civModeUpdated  = false;
-      civPowerUpdated = false;
-      civPTTUpdated   = false;
+      if (civFrameChanged) {
+        updateFromCIV();
+      }
+    }
+    static bool oldInitialized = false;
+
+    if (civDataValid) {
+
+      // ---- initial sync once ----
+      if (!oldInitialized) {
+        old_frequency = frequency;
+        old_mode_str  = mode_str;
+        old_power     = power;
+        lastPostTime  = millis();
+        oldInitialized = true;
+      }
+
+      bool trxChanged =
+      frequency != old_frequency ||
+      mode_str  != old_mode_str  ||
+      power     != old_power;
+
+      if (trxChanged && millis() - lastPostTime > DEBOUNCE_TIME) {
+
+        create_json(frequency, mode_str, ptt_str, power);
+        post_json();
+
+        old_frequency = frequency;
+        old_mode_str  = mode_str;
+        old_power     = power;
+        lastPostTime  = millis();
+      }
     }
 
     // Debug-Output every second
@@ -1341,25 +1490,13 @@ void loop() {
       LOG2(String("[DBG] QRG: ") + String(frequency) + " | MODE: " + mode_str + " | PWR: " + String(power) + " | PTT: " + ptt_str);
       lastDebug = millis();
     }
-
-//    delay(10);
-    if (civDataValid &&
-        frequency > 0 &&
-        mode_str.length() > 0 &&
-        ptt_str.length() > 0 &&
-        (millis() - time_last_update) > DEBOUNCE_TIME) {
-
-    create_json(frequency, mode_str, ptt_str, power);
-    post_json();
-    }
-
+    
     // periodic display refresh (if no new CI-V frames)
     updateDisplay();
-  } else {
+    
+    } 
+    else {
     LOG1("No connection to your WiFi-network.");
     connectToWifi();
   }
-  // allow other tasks without blocking WS
-//  vTaskDelay(1);
-//  delay(5);
 } // end loop
