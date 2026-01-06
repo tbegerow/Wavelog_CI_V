@@ -6,6 +6,7 @@
 #include <HTTPClient.h>
 #include <WiFiManager.h>
 #include <WebServer.h>
+//#include <ESPAsyncWebServer.h>
 #include <SPIFFS.h>
 #include <ESPmDNS.h>
 #include <AsyncTCP.h>
@@ -32,7 +33,8 @@ const int numParams = 6; // number of  parameters
 String params[numParams] = {"", "", "", "", "", ""}; // initialization of parameters
 
 WebServer server(80);
-WebServer XMLRPCserver(12345);
+WiFiServer  rpcServer(12345);
+WiFiClient rpcClient;
 
 // ---------------- timing / constants ---------------------
 unsigned long time_current_baseloop;
@@ -66,13 +68,18 @@ String radioName = "detecting...";
 unsigned long frequency = 0;
 float power = 0.0;
 String mode_str = "";
-String ptt_str = "";
-bool ptt_state = false; // false = RX, true = TX
+volatile bool ptt_state; // = false; // false = RX, true = TX
+bool readPTTState() {
+  noInterrupts();
+  bool v = ptt_state;
+  interrupts();
+  return v;
+}
+
 
 unsigned long old_frequency = 0;
 float old_power = 0.0;
 String old_mode_str = "";
-String old_ptt_str = "";
 
 // ----- state -> create/post json -----
 volatile bool civFreqUpdated  = false;
@@ -130,6 +137,12 @@ size_t power_query_length = sizeof(power_query) / sizeof(power_query[0]);
 
 String buffer;
 DynamicJsonDocument jsonDoc(512);
+//String rpcBody;
+String httpHeader;
+String httpBody;
+
+int contentLength = -1;
+bool headerComplete = false;
 
 String civCommandToHex(const uint8_t *cmd, size_t len) {
   String s;
@@ -194,28 +207,27 @@ void addDebugRaw(const String &msg) {
 }
 
 void broadcastDebug(const String &s) {
-  // broadcastTXT(String&) → mutable Kopie
+  // broadcastTXT(String&) → mutable copy
   String tmp = s;
   webSocket.broadcastTXT(tmp);
 }
 
 void addDebugPrint(const String &msg) {
-  // Immer ins RAM-Log schreiben
+
   addDebugRaw(msg);
 
-  // Serial nur wenn >= 1
+  // Serial onla if level >= 1
   if (debugLevel >= 1) {
     Serial.println(msg);
   }
 
-  // WebSocket nur wenn erlaubt & level >= 1
+  // WebSocket only allowed if enabled & level >= 1
   if (DEBUG_WS && debugLevel >= 1) {
     broadcastDebug(msg);
   }
 }
 
 // --------------------- end Debug ------------------------
-
 // ---------------- WiFi connect ----------------
 void connectToWifi() {
   WiFiManager wfm;
@@ -239,7 +251,7 @@ void updateFromCIV() {
   if (civPTTUpdated) {
 
     if (debugLevel >= 5 && millis() - lastPttLog > 1000) {
-      LOG5("[CI-V] PTT update: " + ptt_str);
+      LOG5("[CI-V] PTT update: " + ptt_state);
       lastPttLog = millis();
     }
   }
@@ -460,38 +472,21 @@ void calculateMode() {
   updateFromCIV();
 }
 
-
 void calculatePTT() {
   // Safe check: if dataIndex is small, log and return
   if (dataIndex < 5) {
-    LOG2(String("calculatePTT: frame too short (len=") + dataIndex + ")");
+    LOG1(String("calculatePTT: frame too short (len=") + dataIndex + ")");
     return;
   }
 
-  uint8_t ptt_int = receivedData[6];
-  switch (ptt_int) {
-    case 0:
-      if (ptt_str != "rx") {
-        ptt_str = "rx";
-        ptt_state = false;
-        digitalWrite(LED_TX, LOW);
-        digitalWrite(LED_RX, HIGH);
-        LOG1("PTT state updated: RX (0)");
-      }
-      break;
-    case 1:
-      if (ptt_str != "tx") {
-        ptt_str = "tx";
-        ptt_state = true;
-        digitalWrite(LED_TX, HIGH);
-        digitalWrite(LED_RX, LOW);
-        LOG1("PTT state updated: TX (1)");
-      }
-      break;
-    default:
-      // unknown value: ignore
-      break;
-    LOG2(String("PTT RAW=") + String(receivedData[5], HEX));
+  bool new_ptt = (receivedData[6] == 1);
+
+  if (ptt_state != new_ptt) {
+    ptt_state = new_ptt;
+
+    LOG1(new_ptt
+         ? "PTT state updated: TX (1)"
+         : "PTT state updated: RX (0)");
   }
 }
 
@@ -533,11 +528,18 @@ void processReceivedData(void) {
     const uint8_t CIV_CONTROLLER = 0xE0;
     const uint8_t CIV_RADIO = civRadioAddr;
 
-    bool isRadioFrame = //(fromAddr == CIV_RADIO);
+    static unsigned long bootTime = millis();
+    bool startupPhase = (millis() - bootTime < 3000);
+
+    bool isRadioFrame =
       (fromAddr == CIV_RADIO) &&
       (toAddr == CIV_CONTROLLER || toAddr == 0x00);
-    // PTT frames are sometimes broadcast → allow them
-    if (cmd == 0x1C && fromAddr == CIV_RADIO) {
+
+    if (startupPhase && fromAddr == CIV_RADIO) {
+      isRadioFrame = true;
+    }
+    if ((cmd == 0x01 || cmd == 0x00 || cmd == 0x03) &&
+        fromAddr == CIV_RADIO) {
       isRadioFrame = true;
     }
 
@@ -585,9 +587,15 @@ void processReceivedData(void) {
         break;
 
       case 0x1C:
-        if (dataIndex >= 6) {
+        if (dataIndex >= 7) {
+          bool old_ptt = ptt_state;
+
           calculatePTT();
-          civPTTUpdated = true;
+
+          if (ptt_state != old_ptt) {
+            civPTTUpdated = true;
+          }
+
           civDataValid = true;
           time_last_update = millis();
         }
@@ -666,12 +674,12 @@ void updateDisplay() {
 }
 
 // ---------------- JSON / HTTP / XMLRPC ----------------
-void create_json(unsigned long frequency, String mode, String ptt, float power) {  
+void create_json(unsigned long frequency, String mode, bool ptt, float power) {  
   jsonDoc.clear();  
   jsonDoc["radio"] = radioName + " Wavelog CI-V";
   jsonDoc["frequency"] = frequency;
   jsonDoc["mode"] = mode;
-  jsonDoc["ptt"] = ptt;
+  jsonDoc["ptt"] = ptt_state ? "tx" : "rx";
   jsonDoc["ptt_state"] = ptt_state ? 1 : 0;
   jsonDoc["power"] = power;
   jsonDoc["downlink_freq"] = 0;
@@ -879,7 +887,7 @@ void handleTrx() {
   jsonDoc["qrg"] = frequency;
   jsonDoc["mode"] = mode_str;
   jsonDoc["power"] = power;
-  jsonDoc["ptt"] = ptt_str;
+  jsonDoc["ptt"] = ptt_state;
   serializeJson(jsonDoc, buffer);
   server.send(200, "application/json", buffer);
 }
@@ -1133,14 +1141,11 @@ int detectCivAddress() {
       }
     }
   }
-
   LOG1("Auto-detect failed: no CI-V device responded");
   return -1;
 }
 
-
 // ---------------- SPIFFS params IO ----------------
-
 void loadParametersFromSPIFFS() {
   for (int i = 0; i < numParams; ++i) {
     File file = SPIFFS.open("/param" + String(i) + ".txt", "r");
@@ -1207,84 +1212,183 @@ String rig_get_mode() {
   return mode_str;
 }
 
-String rig_get_ptt() {
-  return ptt_str;
-}
+//String rig_get_ptt() {
+//  return ptt_state;
+//}
 
 // ---------------- XML-RPC handling ----------------
-void handleRPC() {
-  // DEBUG Trace
-  LOG4("=== Incoming RPC Request ===");
-  LOG4(String("Client: ") + XMLRPCserver.client().remoteIP().toString());
-  
-  // HTTP Header
-  for (int i = 0; i < XMLRPCserver.args(); i++) {
-    LOG4(String("Arg ") + i + ": " + XMLRPCserver.argName(i));
-    LOG4(String("Value: ") + XMLRPCserver.arg(i));
+void processXMLRPC(String &req, WiFiClient &client) {
+
+  String response;
+
+  if (req.indexOf("<methodName>rig.get_vfo</methodName>") != -1) {
+    response = "VFOA";
+    LOG4("XMLRPC-Response (rig.get_vfo): VFOA");
   }
-
-  String request = XMLRPCserver.arg(0);
-  LOG4("=== XML Request ===");
-  LOG4(request);
-  LOG4("===============================");
-
-  // processing XML-RPC-request
-  // === rig.get_vfo ===
-  if (request.indexOf("<methodName>rig.get_vfo</methodName>") != -1) {
-    String response = rig_get_vfo();
-    String xmlResponse =
-      "<?xml version=\"1.0\"?>"
-      "<methodResponse>"
-        "<params>"
-          "<param>"
-            "<value><string>" + response + "</string></value>"
-          "</param>"
-        "</params>"
-      "</methodResponse>";
-    XMLRPCserver.send(200, "text/xml", xmlResponse);
-    LOG4(String("XMLRPC-Response (rig.get_vfo): ") + xmlResponse);
+  else if (req.indexOf("<methodName>rig.get_freq</methodName>") != -1) {
+    response = String(frequency);
+    LOG4("XMLRPC-Response (rig.get_freq): " + String(frequency));
   }
-
-  // === rig.get_mode ===
-  else if (request.indexOf("<methodName>rig.get_mode</methodName>") != -1) {
-    String response = mode_str;
-    String xmlResponse =
-      "<?xml version=\"1.0\"?>"
-      "<methodResponse>"
-        "<params>"
-          "<param>"
-            "<value><string>" + response + "</string></value>"
-          "</param>"
-        "</params>"
-      "</methodResponse>";
-    XMLRPCserver.send(200, "text/xml", xmlResponse);
-    LOG4(String("XMLRPC-Response (rig.get_mode): ") + xmlResponse);
+  else if (req.indexOf("<methodName>rig.get_mode</methodName>") != -1) {
+    response = mode_str;
+    LOG4("XMLRPC-Response (rig.get_mode): " + mode_str);
   }
-
-  // === rig.get_ptt ===
-  else if (request.indexOf("<methodName>rig.get_ptt</methodName>") != -1) {
-    String response = ptt_state ? "1" : "0";
-    String xmlResponse =
-      "<?xml version=\"1.0\"?>"
-      "<methodResponse>"
-        "<params>"
-          "<param>"
-            "<value><boolean>" + response + "</boolean></value>"
-            "<value><string>" + response + "</string></value>"   // Fallback for HAMClock
-          "</param>"
-        "</params>"
-      "</methodResponse>";
-    XMLRPCserver.send(200, "text/xml", xmlResponse);
-
-    LOG4("----- XML-RPC Response Sent -----");
-    LOG4(xmlResponse);
-    LOG4("----- END Response -----");
-  // === unknown ===
-  }  else {
-    XMLRPCserver.send(400, "text/plain", "Unknown method");
-    LOG1("XMLRPC: Unknown method requested");
+  else if (req.indexOf("<methodName>rig.get_ptt</methodName>") != -1) {
+    int ptt = readPTTState() ? 1 : 0;
+    sendXMLRPCResponsePTT(client, ptt);
+    LOG4("XMLRPC-Response (rig.get_ptt): " + String(ptt));
     return;
   }
+  else {
+    if (req.indexOf("<methodCall>") == -1) return;
+    return;
+  }
+
+  sendXMLRPCResponse(client, response);
+}
+
+void sendXMLRPCResponse(WiFiClient &client, String value) {
+  String body =
+    "<?xml version=\"1.0\"?>\r\n"
+    "<methodResponse>\r\n"
+      "<params><param>\r\n"
+        "<value><string>" + value + "</string></value>\r\n"
+      "</param></params>\r\n"
+    "</methodResponse>\r\n";
+
+  String header =
+    "HTTP/1.1 200 OK\r\n"
+    "Server: XMLRPC++ 0.8\r\n"
+    "Content-Type: text/xml\r\n"
+    "Content-Length: " + String(body.length()) + "\r\n"
+    "Connection: keep-alive\r\n\r\n";
+
+  LOG4("RPC TX HEADER:");
+  LOG4(header);
+  LOG4("RPC TX BODY:");
+  LOG4(body);
+
+  client.print(header);
+  client.print(body);
+}
+
+void sendXMLRPCResponsePTT(WiFiClient &client, int value) {
+  String body =
+    "<?xml version=\"1.0\"?>\r\n"
+    "<methodResponse>\r\n"
+      "<params>\r\n"
+        "<param>\r\n"
+          "<value><i4>" + String(value) + "</i4></value>\r\n"
+        "</param>\r\n"
+      "</params>\r\n"
+    "</methodResponse>\r\n";
+
+  String response =
+    "HTTP/1.1 200 OK\r\n"
+    "Server: XMLRPC++ 0.8\r\n"
+    "Content-Type: text/xml\r\n"
+    "Content-Length: " + String(body.length()) + "\r\n"
+//    "Connection: keep-alive\r\n\r\n";
+    "\r\n" +
+    body;
+
+  LOG4("RPC TX RESPONSE:");
+  LOG4(response);
+  
+  client.print(response);
+}
+
+unsigned long lastRPC = 0;
+
+void handleRPCServer() {
+  // ---- Keep-Alive Timeout ----
+  if (rpcClient && rpcClient.connected()) {
+    if (!headerComplete && httpHeader.length() == 0) {
+    } else if (millis() - lastRPC > 15000) {   // 15 sec
+      LOG4("RPC keep-alive timeout, closing");
+      rpcClient.stop();
+      return;
+    }
+  }
+
+  if (!rpcClient || !rpcClient.connected()) {
+    rpcClient = rpcServer.available();
+    if (rpcClient) {
+      httpHeader = "";
+      httpBody = "";
+      contentLength = -1;
+      headerComplete = false;
+      lastRPC = millis();
+      LOG4("RPC client connected");
+    }
+    return;
+  }
+
+  while (rpcClient.available()) {
+    lastRPC = millis();
+    char c = rpcClient.read();
+
+    // ---- HEADER PHASE ----
+    if (!headerComplete) {
+      httpHeader += c;
+
+      if (httpHeader.endsWith("\r\n\r\n")) {
+        headerComplete = true;
+
+        String headerLower = httpHeader;
+        headerLower.toLowerCase();
+
+        int idx = headerLower.indexOf("content-length:");
+          if (idx >= 0) {
+            int end = headerLower.indexOf("\r\n", idx);
+            String lenStr = headerLower.substring(idx + 15, end);
+            lenStr.trim();
+            contentLength = lenStr.toInt();
+          }
+
+        LOG4("RPC RX HEADER:");
+        LOG4(httpHeader);
+        LOG4("Parsed Content-Length: " + String(contentLength));
+
+        if (contentLength <= 0) {
+          LOG4("Invalid Content-Length → 400");
+          sendHTTPError(rpcClient);
+          rpcClient.stop();
+          return;
+        }
+      }
+    }
+
+    // ---- BODY PHASE ----
+    else {
+      httpBody += c;
+
+      if (httpBody.length() >= contentLength) {
+        LOG4("RPC RX BODY:");
+        LOG4(httpBody);
+
+        processXMLRPC(httpBody, rpcClient);
+
+        httpHeader = "";
+        httpBody = "";
+        contentLength = -1;
+        headerComplete = false;
+
+        lastRPC = millis();
+        LOG4("RPC request handled, keep-alive");
+//        return;
+      }
+    }
+  }
+}
+
+void sendHTTPError(WiFiClient &client) {
+  client.print(
+    "HTTP/1.1 400 Bad Request\r\n"
+    "Content-Length: 0\r\n"
+    "Connection: close\r\n"
+    "\r\n"
+  );
 }
 
 // ---------------- Setup ----------------
@@ -1370,7 +1474,8 @@ void setup() {
   LOG1(String("IP-Address: ") + WiFi.localIP().toString());
   
   // --- Initial CI-V read at startup ---
-  delay(400);   // small delay to let CI-V settle
+  delay(500);   // small delay to let CI-V settle
+  getqrg();     // read qrg immidiately
   getmode();    // read mode immediately
   getpower();   // read power immediately
   getptt();     // get PTT state at startup
@@ -1405,28 +1510,30 @@ void setup() {
   LOG1("WebSocket server started on port 81");
 
   // Routing for XML-RPC-requests
-  XMLRPCserver.on("/", handleRPC);
-  XMLRPCserver.begin();
-  LOG1("XMLRPCserver started");
-
+  rpcServer.begin();
+  rpcServer.setNoDelay(true);
+  LOG1("FLRIG-compatible XML-RPC server started on port 12345");
+  
   delay(1000);
   time_current_baseloop = millis();
   time_last_baseloop = time_current_baseloop;
 
   if (civDataValid) {
-    create_json(frequency, mode_str, ptt_str, power);
+    create_json(frequency, mode_str, readPTTState(), power);
     post_json();
   } else {
     Serial.println("Skipping POST: No valid TRX data yet.");
   }
-//  }
 }
 
 // ---------------- Loop ----------------
 void loop() {
-  webSocket.loop();
   server.handleClient();
-  XMLRPCserver.handleClient();
+  // === XML-RPC (HamClock /FLRIG ) ===
+  handleRPCServer();
+
+  webSocket.loop();
+//  server.handleClient();
 
   if (WiFi.status() == WL_CONNECTED) {
     time_current_baseloop = millis();
@@ -1445,6 +1552,22 @@ void loop() {
     
     if (geticomdata()) {
       processReceivedData();
+      
+      // ---------- Initial CI-V sync (once, after RX is alive) ----------
+      static bool initialCivQueryDone = false;
+
+      if (!initialCivQueryDone && activeCivAddr != 0) {
+        LOG1("CI-V RX active – performing initial TRX sync");
+
+        delay(50);
+        getqrg();
+        delay(30);
+        getmode();
+        delay(30);
+        getpower();
+
+        initialCivQueryDone = true;
+      }
       
       bool civFrameChanged =
         civFreqUpdated ||
@@ -1475,7 +1598,7 @@ void loop() {
 
       if (trxChanged && millis() - lastPostTime > DEBOUNCE_TIME) {
 
-        create_json(frequency, mode_str, ptt_str, power);
+        create_json(frequency, mode_str, readPTTState(), power);
         post_json();
 
         old_frequency = frequency;
@@ -1487,7 +1610,7 @@ void loop() {
 
     // Debug-Output every second
     if (millis() - lastDebug > 1000) {
-      LOG2(String("[DBG] QRG: ") + String(frequency) + " | MODE: " + mode_str + " | PWR: " + String(power) + " | PTT: " + ptt_str);
+      LOG2(String("[DBG] QRG: ") + String(frequency) + " | MODE: " + mode_str + " | PWR: " + String(power) + " | PTT: " + ptt_state);
       lastDebug = millis();
     }
     
