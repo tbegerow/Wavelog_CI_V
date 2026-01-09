@@ -27,10 +27,22 @@ int debugIndex = 0;
 WebSocketsServer webSocket = WebSocketsServer(81); // WebSocket-Server on Port 81
 
 // ---------------- Web / params / servers ------------------
-const char* html_username = "sysop";  // Webif username
-const char* html_password = "admin";  // Webif password
+String webUser = "sysop";  // Webif username
+String webPass = "admin";  // Webif password
 const int numParams = 6; // number of  parameters
 String params[numParams] = {"", "", "", "", "", ""}; // initialization of parameters
+
+// ----------------- Web secure ----------------------------
+struct LoginAttempt {
+  IPAddress ip;
+  uint8_t failures;
+  unsigned long blockedUntil;
+};
+#define MAX_LOGIN_ATTEMPTS 5
+#define BLOCK_TIME_MS     (5UL * 60UL * 1000UL)   // 5 min
+#define MAX_LOGIN_TRACKS  6                       // max. IPs at same time
+LoginAttempt loginAttempts[MAX_LOGIN_TRACKS];
+unsigned long authBypassUntil = 0;
 
 WebServer server(80);
 WiFiServer  rpcServer(12345);
@@ -76,10 +88,14 @@ bool readPTTState() {
   return v;
 }
 
-
 unsigned long old_frequency = 0;
 float old_power = 0.0;
 String old_mode_str = "";
+bool modeValid = false;
+bool modeQueryPending = false;
+bool modeRetryDone = false;
+unsigned long lastModeQuery = 0;
+unsigned long lastFreqChange = 0;
 
 // ----- state -> create/post json -----
 volatile bool civFreqUpdated  = false;
@@ -418,6 +434,81 @@ void updateRadioName() {
        " (0x" + String(activeCivAddr, HEX) + ")");
 }
 
+int findLoginSlot(IPAddress ip) {
+  for (int i = 0; i < MAX_LOGIN_TRACKS; i++) {
+    if (loginAttempts[i].ip == ip) return i;
+  }
+
+  // freien Slot suchen
+  for (int i = 0; i < MAX_LOGIN_TRACKS; i++) {
+    if (loginAttempts[i].ip == IPAddress(0,0,0,0)) {
+      loginAttempts[i].ip = ip;
+      loginAttempts[i].failures = 0;
+      loginAttempts[i].blockedUntil = 0;
+      return i;
+    }
+  }
+
+  return -1; // voll
+}
+
+bool isBlocked(IPAddress ip) {
+  int idx = findLoginSlot(ip);
+  if (idx < 0) return false;
+
+  if (loginAttempts[idx].blockedUntil > millis()) {
+    return true;
+  }
+
+  return false;
+}
+
+void loginSuccess(IPAddress ip) {
+  int idx = findLoginSlot(ip);
+  if (idx < 0) return;
+
+  loginAttempts[idx].failures = 0;
+  loginAttempts[idx].blockedUntil = 0;
+}
+
+void loginFailure(IPAddress ip) {
+  int idx = findLoginSlot(ip);
+  if (idx < 0) return;
+
+  loginAttempts[idx].failures++;
+
+  if (loginAttempts[idx].failures >= MAX_LOGIN_ATTEMPTS) {
+    loginAttempts[idx].blockedUntil = millis() + BLOCK_TIME_MS;
+    LOG1("IP blocked: " + ip.toString());
+  }
+}
+
+bool checkAuthWithRateLimit() {
+
+  //  Grace period after credential change
+  if (millis() < authBypassUntil) {
+    return true;
+  }
+
+  IPAddress ip = server.client().remoteIP();
+
+  //  IP block check
+  if (isBlocked(ip)) {
+    return false;
+  }
+
+  //  Auth check
+  if (!server.authenticate(webUser.c_str(), webPass.c_str())) {
+    loginFailure(ip);
+    return false;
+  }
+
+  //  Success
+  loginSuccess(ip);
+  return true;
+}
+
+
 // ---------------- parsers ----------------
 void calculateQRG() {
   if (dataIndex < 9) {
@@ -440,6 +531,26 @@ void calculateQRG() {
   frequency = freq;
 
   LOG2(String("calculateQRG -> ") + String(frequency));
+}
+
+void onFrequencyUpdated() {
+
+  static unsigned long lastFreqChange = 0;
+  lastFreqChange = millis();
+
+  // MODE invalidieren
+  modeValid = false;
+}
+
+void handleModeFrame() {
+  calculateMode();
+  civModeUpdated = true;
+
+  modeValid = true;
+  modeQueryPending = false;
+  modeRetryDone = false;
+
+  LOG1("MODE locked: " + mode_str);
 }
 
 void calculateMode() {
@@ -523,7 +634,10 @@ void processReceivedData(void) {
     byte fromAddr = receivedData[3];
     byte cmd      = receivedData[4];
 
-    
+//    LOG1("CI-V RX cmd=0x" + String(cmd, HEX) +
+//     " len=" + String(dataIndex) +
+//     " from=0x" + String(fromAddr, HEX) +
+//     " to=0x" + String(toAddr, HEX));
 
     const uint8_t CIV_CONTROLLER = 0xE0;
     const uint8_t CIV_RADIO = civRadioAddr;
@@ -571,18 +685,33 @@ void processReceivedData(void) {
         if (dataIndex >= 10) {
           calculateQRG();
           civFreqUpdated = true;
+          lastFreqChange = millis();
 
-          if (frequency > 1000000UL) {
+          modeValid = false;
+          modeQueryPending = false;
+          modeRetryDone = false;
+
+            if (!civModeUpdated) {
+              LOG1("Triggering delayed MODE query");
+              getmode();
+            }
+
             civDataValid = true;
             time_last_update = millis();
-          }
         }
         break;
 
-      case 0x01:
-        if (dataIndex >= 6) {
-          calculateMode();
-          civModeUpdated = true;
+      case 0x01:   // Mode transceive / change
+        if (dataIndex >= 7) {
+          handleModeFrame();
+          LOG3("CI-V MODE (CMD 01) len=" + String(dataIndex));
+        }
+        break;
+
+      case 0x04:   // Read operating mode
+        if (dataIndex >= 7) {
+          handleModeFrame();
+          LOG3("CI-V MODE (CMD 04) len=" + String(dataIndex));
         }
         break;
 
@@ -729,7 +858,7 @@ void post_json() {
 
 // ---------- Web root with JS that polls /trx ----------
 void handleRoot() {
-  if (!server.authenticate(html_username, html_password)) {
+  if (!checkAuthWithRateLimit()) {
     return server.requestAuthentication();
   }
 
@@ -759,6 +888,11 @@ void handleRoot() {
   html += "<input type='text' id='wavelogApiEndpoint' name='wavelogApiEndpoint' value='" + params[1] + "'><br>";
   html += "<label for='wavelogApiKey'>Wavelog API Key:</label><br>";
   html += "<input type='text' id='wavelogApiKey' name='wavelogApiKey' value='" + params[2] + "'><br>";
+  html += "<h3>Web Login</h3>";
+  html += "<label>Username:</label><br>";
+  html += "<input type='text' name='webUser' value='" + webUser + "'><br>";
+  html += "<label>Password:</label><br>";
+  html += "<input type='password' name='webPass' value='" + webPass + "'><br>";
   // --- TRX ADDRESS (HEX values, plus AUTO option) ---
   html += "<div style='display:flex; align-items:center; gap:10px;'>";
   html += "<div>";
@@ -809,7 +943,7 @@ void handleRoot() {
   html += "<p id='debugSetResult'></p>";
 
   html += "<p><a href='/debug'>Debug (page)</a> | <a href='/debugws'>Debug WS (live)</a></p>";
-  html += "<form action='/logged-out' method='post'>";
+  html += "<form action='/logout' method='post'>";
   html += "<button type='submit' class='btn-logout'>Logout</button>";
   html += "</form>";
   html += "</div>";
@@ -880,14 +1014,16 @@ void handleRoot() {
 
 // handle /trx used by root page
 void handleTrx() {
-  if (!server.authenticate(html_username, html_password)) {
-    return server.requestAuthentication();
+  if (!checkAuthWithRateLimit()) {
+    server.send(401, "application/json",
+      "{\"error\":\"unauthorized\"}");
+    return;
   }
   jsonDoc.clear();
   jsonDoc["qrg"] = frequency;
   jsonDoc["mode"] = mode_str;
   jsonDoc["power"] = power;
-  jsonDoc["ptt"] = ptt_state;
+  jsonDoc["ptt"] = ptt_state ? "tx" : "rx";
   serializeJson(jsonDoc, buffer);
   server.send(200, "application/json", buffer);
 }
@@ -914,8 +1050,7 @@ void handleToggleOled() {
 }
 
 void handleAutoDetect() {
-
-  if (!server.authenticate(html_username, html_password)) {
+  if (!server.authenticate(webUser.c_str(), webPass.c_str())) {
     return server.requestAuthentication();
   }
 
@@ -947,13 +1082,13 @@ void handleAutoDetect() {
 }
 
 void handleLogout() {
-  server.send(401);
+  server.send(401, "text/plain", "Logged out. Please re-login.");
 }
 
-void handleLoggedout() {
-  String html = "<!DOCTYPE html><html><head><meta charset=\"UTF-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\"><title>ESP32 Configuration Logout</title></head><body><div><h1>Logout</h1><form action='/' method='post'><button type='submit'>Return to Homepage</button></form></div></body></html>";
-  server.send(200, "text/html", html);
-}
+//void handleLoggedout() {
+//  String html = "<!DOCTYPE html><html><head><meta charset=\"UTF-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\"><title>ESP32 Configuration Logout</title></head><body><div><h1>Logout</h1><form action='/' method='post'><button type='submit'>Return to Homepage</button></form></div></body></html>";
+//  server.send(200, "text/html", html);
+//}
 
 void handle_NotFound(){
   server.send(404, "text/plain", "Not found");
@@ -982,8 +1117,10 @@ void handleSetDebug() {
 
 // Debug page (plain log)
 void handleDebugPage() {
-  if (!server.authenticate(html_username, html_password)) {
-    return server.requestAuthentication();
+  if (!checkAuthWithRateLimit()) {
+    server.send(401, "application/json",
+      "{\"error\":\"unauthorized\"}");
+    return;
   }
   String html = "<!DOCTYPE html><html><head><meta charset='utf-8'><title>ESP32 Debug Log</title>";
   html += "<style>body{font-family:monospace;background:#000;color:#0f0;padding:10px;white-space:pre-wrap}</style></head><body>";
@@ -1001,8 +1138,10 @@ void handleDebugPage() {
 
 // Live WebSocket Debug page (connects to ws://<ip>:81)
 void handleDebugWSPage() {
-  if (!server.authenticate(html_username, html_password)) {
-    return server.requestAuthentication();
+  if (!checkAuthWithRateLimit()) {
+    server.send(401, "application/json",
+      "{\"error\":\"unauthorized\"}");
+    return;
   }
   String html = "<!DOCTYPE html><html><head><meta charset='utf-8'><title>Live Debug Console</title>";
   html += "<style>body{font-family:monospace;background:#000;color:#0f0;padding:10px}#log{height:70vh;overflow:auto;border:1px solid #444;padding:5px;background:#050505}</style></head><body>";
@@ -1170,13 +1309,46 @@ void saveParametersToSPIFFS() {
   }
 }
 
-void handleSave() {
-  if (!server.authenticate(html_username, html_password)) {
-    return server.requestAuthentication();
+void loadWebAuth() {
+  if (!SPIFFS.exists("/web_auth.json")) {
+    LOG1("No web_auth.json, using defaults");
+    return;
   }
 
-  // Basiskonfiguration
-  // -------------------------------
+  File f = SPIFFS.open("/web_auth.json", "r");
+  if (!f) return;
+
+  StaticJsonDocument<128> doc;
+  if (deserializeJson(doc, f) == DeserializationError::Ok) {
+    webUser = doc["user"] | webUser;
+    webPass = doc["pass"] | webPass;
+    LOG1("Web auth loaded from SPIFFS");
+  }
+  f.close();
+}
+
+void saveWebAuth() {
+  StaticJsonDocument<128> doc;
+  doc["user"] = webUser;
+  doc["pass"] = webPass;
+
+  File f = SPIFFS.open("/web_auth.json", "w");
+  if (!f) return;
+
+  serializeJson(doc, f);
+  f.close();
+
+  LOG1("Web auth saved");
+}
+
+void handleSave() {
+  if (!checkAuthWithRateLimit()) {
+    server.send(401, "application/json",
+      "{\"error\":\"unauthorized\"}");
+    return;
+  }
+
+  // ---------- Config ----------
   params[0] = server.arg("wavelogUrl");
   params[1] = server.arg("wavelogApiEndpoint");
   params[2] = server.arg("wavelogApiKey");
@@ -1195,12 +1367,49 @@ void handleSave() {
   } 
 
   saveParametersToSPIFFS();
+  
+  // ---------- Web Auth ----------
+  bool authChanged = false;
+
+  if (server.hasArg("webUser")) {
+    String newUser = server.arg("webUser");
+    if (newUser.length() && newUser != webUser) {
+      webUser = newUser;
+      authChanged = true;
+    }
+  }
+
+  if (server.hasArg("webPass")) {
+    String newPass = server.arg("webPass");
+    if (newPass.length() && newPass != webPass) {
+      webPass = newPass;
+      authChanged = true;
+    }
+  }
+
+  if (authChanged) {
+    saveWebAuth();
+    authBypassUntil = millis() + 10000;
+  }
+
+  // ---------- Force re-auth ----------
+  if (authChanged) {
+    server.sendHeader("WWW-Authenticate", "Basic realm=\"ESP32\"");
+    server.sendHeader("Connection", "close");
+    server.send(401, "text/plain", "Credentials changed. Please re-login.");
+    return;
+  }
 
   server.sendHeader("Location", "/", true);
   server.send(302, "text/plain", "");
 }
 
 void handleReboot() {
+  if (!checkAuthWithRateLimit()) {
+    server.send(401, "application/json",
+      "{\"error\":\"unauthorized\"}");
+    return;
+  }
   ESP.restart();
 }
 
@@ -1407,6 +1616,7 @@ void setup() {
   }
   
   loadParametersFromSPIFFS();
+  loadWebAuth();
 
   delay(5);
   loadDebugLevel();
@@ -1476,7 +1686,7 @@ void setup() {
   // --- Initial CI-V read at startup ---
   delay(500);   // small delay to let CI-V settle
   getqrg();     // read qrg immidiately
-  getmode();    // read mode immediately
+//  getmode();    // read mode immediately
   getpower();   // read power immediately
   getptt();     // get PTT state at startup
 
@@ -1488,8 +1698,8 @@ void setup() {
   server.on("/autodetect", HTTP_POST, handleAutoDetect);
   server.on("/save", HTTP_POST, handleSave);
   server.on("/reboot", HTTP_POST, handleReboot);
-  server.on("/logout", HTTP_GET, handleLogout, handleLoggedout);
-  server.on("/logged-out", HTTP_GET, handleLoggedout);
+  server.on("/logout", HTTP_GET, handleLogout);
+//  server.on("/logged-out", HTTP_GET, handleLoggedout);
   server.onNotFound(handle_NotFound);
 
   // Debug Live WebSocket page
@@ -1549,7 +1759,7 @@ void loop() {
       getptt();  // get ptt-state from TRX
       lastPTTQuery = millis();
     }
-    
+
     if (geticomdata()) {
       processReceivedData();
       
@@ -1562,9 +1772,13 @@ void loop() {
         delay(50);
         getqrg();
         delay(30);
-        getmode();
-        delay(30);
         getpower();
+
+        // Force MODE fetch via delayed logic
+        modeValid = false;
+        modeQueryPending = false;
+        modeRetryDone = false;
+        lastFreqChange = millis();
 
         initialCivQueryDone = true;
       }
@@ -1577,7 +1791,33 @@ void loop() {
       if (civFrameChanged) {
         updateFromCIV();
       }
+      // ---- delayed MODE query after stable frequency ----
+      if (!modeValid &&
+          !modeQueryPending &&
+          civDataValid &&
+          millis() - lastFreqChange > 150) {
+
+        LOG3("Requesting MODE after stable QRG");
+        getmode();
+
+        modeQueryPending = true;
+        lastModeQuery = millis();
+      }
+      // ---- MODE fallback retry (once) ----
+      if (modeQueryPending && millis() - lastModeQuery > 500) {
+
+        if (!modeRetryDone) {
+          LOG3("MODE query timeout – retrying once");
+          getmode();
+          lastModeQuery = millis();
+          modeRetryDone = true;
+        } else {
+          LOG3("MODE retry failed – giving up");
+          modeQueryPending = false;
+        }
+      }
     }
+
     static bool oldInitialized = false;
 
     if (civDataValid) {
