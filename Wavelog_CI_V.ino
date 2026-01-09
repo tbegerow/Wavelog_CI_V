@@ -687,17 +687,8 @@ void processReceivedData(void) {
           civFreqUpdated = true;
           lastFreqChange = millis();
 
-          modeValid = false;
-          modeQueryPending = false;
-          modeRetryDone = false;
-
-            if (!civModeUpdated) {
-              LOG1("Triggering delayed MODE query");
-              getmode();
-            }
-
-            civDataValid = true;
-            time_last_update = millis();
+          civDataValid = true;
+          time_last_update = millis();
         }
         break;
 
@@ -1776,9 +1767,10 @@ void loop() {
 
         // Force MODE fetch via delayed logic
         modeValid = false;
-        modeQueryPending = false;
+        modeQueryPending = true;
         modeRetryDone = false;
         lastFreqChange = millis();
+        lastModeQuery = millis();
 
         initialCivQueryDone = true;
       }
@@ -1791,18 +1783,7 @@ void loop() {
       if (civFrameChanged) {
         updateFromCIV();
       }
-      // ---- delayed MODE query after stable frequency ----
-      if (!modeValid &&
-          !modeQueryPending &&
-          civDataValid &&
-          millis() - lastFreqChange > 150) {
 
-        LOG3("Requesting MODE after stable QRG");
-        getmode();
-
-        modeQueryPending = true;
-        lastModeQuery = millis();
-      }
       // ---- MODE fallback retry (once) ----
       if (modeQueryPending && millis() - lastModeQuery > 500) {
 
